@@ -59,9 +59,9 @@ ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
 
 ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.15.0
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=bind,source=.git,target=.git \
     pip install --no-build-isolation .
 
 # install additional dependencies for openai api server
