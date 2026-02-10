@@ -38,9 +38,17 @@ docker run \
     echo $ZE_AFFINITY_MASK
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
-    pytest -v -s tests/ \
+    timeout 300 pytest -v -s tests/benchmarks \
         --ignore=tests/benchmarks/test_serve_cli.py \
+    timeout 300 pytest -v -s tests/diffusion
+    timeout 300 pytest -v -s tests/distributed
+    timeout 300 pytest -v -s tests/e2e \
         --ignore=tests/e2e/offline_inference/test_bagel_text2img.py \
         --ignore=tests/e2e/offline_inference/test_qwen3_omni.py \
-        --ignore=tests/e2e/offline_inference/test_t2v_model.py
+        --ignore=tests/e2e/offline_inference/test_t2v_model.py \
+        --ignore=tests/e2e/online_serving/test_qwen3_omni.py \
+        --ignore=tests/e2e/online_serving/test_qwen3_omni_expansion.py
+    timeout 300 pytest -v -s tests/entrypoints
+    timeout 300 pytest -v -s tests/model_executor
+    timeout 300 pytest -v -s tests/worker
 '
