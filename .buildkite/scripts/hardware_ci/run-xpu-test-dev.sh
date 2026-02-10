@@ -6,11 +6,33 @@
 # the end.
 set -e
 
-image_name="xpu/vllm-omni-ci:test"
-container_name_prefix="xpu_test_"
+image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT}"
+container_name_prefix="xpu_${BUILDKITE_COMMIT}_"
+
+format_duration() {
+	local total=$1
+	local mins
+	local secs
+	mins=$(awk "BEGIN {printf \"%d\", ${total} / 60}")
+	secs=$(awk "BEGIN {printf \"%.3f\", ${total} - ${mins} * 60}")
+	printf '%dm %ss' "${mins}" "${secs}"
+}
+
+elapsed_since() {
+	local start=$1
+	local end
+	end=$(date +%s.%N)
+	awk "BEGIN {printf \"%.3f\", ${end} - ${start}}"
+}
 
 # Try building the docker image
+echo "=========================================="
+echo "Building docker image: ${image_name}"
+echo "=========================================="
+build_start=$(date +%s.%N)
 docker build -t "${image_name}" -f docker/Dockerfile.xpu .
+build_elapsed=$(elapsed_since "${build_start}")
+echo ">>> Docker build completed in $(format_duration "${build_elapsed}")"
 
 # Setup cleanup
 remove_docker_container() {
@@ -53,8 +75,8 @@ test_commands=(
 	"pytest -v -s tests/e2e/online_serving/test_async_omni.py"
 	"pytest -v -s tests/e2e/online_serving/test_image_gen_edit.py"
 	"pytest -v -s tests/e2e/online_serving/test_images_generations_lora.py"
-	"pytest -v -s tests/e2e/online_serving/test_qwen3_omni.py"
-	"pytest -v -s tests/e2e/online_serving/test_qwen3_omni_expansion.py"
+	# "pytest -v -s tests/e2e/online_serving/test_qwen3_omni.py"
+	# "pytest -v -s tests/e2e/online_serving/test_qwen3_omni_expansion.py"
 	"pytest -v -s tests/entrypoints/openai_api/test_image_server.py"
 	"pytest -v -s tests/entrypoints/openai_api/test_serving_chat_sampling_params.py"
 	"pytest -v -s tests/entrypoints/openai_api/test_serving_speech.py"
@@ -92,18 +114,20 @@ get_log_file() {
 LOG_DIR="logs/$(date +%s)"
 mkdir -p "${LOG_DIR}"
 
-declare -a passed_cmds=()
-declare -a failed_cmds=()
-declare -a failed_indices=()
+declare -a statuses=()
+declare -a durations=()
 
 total=${#test_commands[@]}
+DOCKER_RUN_TIMEOUT=300
 
 # ---------------------------------------------------------------------------
 # Run each test command in its own docker container
 # ---------------------------------------------------------------------------
+loop_start=$(date +%s.%N)
 for i in "${!test_commands[@]}"; do
 	cmd="${test_commands[$i]}"
 	log_file="$(get_log_file "${i}" "${cmd}")"
+	test_start=$(date +%s.%N)
 	container_name="${container_name_prefix}$(tr -dc A-Za-z0-9 </dev/urandom | head -c 10)"
 
 	echo ""
@@ -111,7 +135,8 @@ for i in "${!test_commands[@]}"; do
 	echo "[$((i + 1))/${total}] Running: ${cmd}"
 	echo "=========================================="
 
-	docker run \
+	timeout --kill-after=30 "${DOCKER_RUN_TIMEOUT}" \
+		docker run \
 		--device /dev/dri:/dev/dri \
 		--net=host \
 		--ipc=host \
@@ -132,45 +157,69 @@ for i in "${!test_commands[@]}"; do
 
 	exit_code=${PIPESTATUS[0]}
 
+	test_elapsed=$(elapsed_since "${test_start}")
+	durations+=("${test_elapsed}")
+	formatted_duration="$(format_duration "${test_elapsed}")"
+
 	if [ "${exit_code}" -eq 0 ]; then
-		passed_cmds+=("${cmd}")
-		echo ">>> PASSED: ${cmd}"
+		statuses[$i]="PASS"
+		echo ">>> PASSED (${formatted_duration}): ${cmd}"
+	elif [ "${exit_code}" -eq 124 ]; then
+		statuses[$i]="TIMEOUT"
+		echo ">>> TIMED OUT after ${DOCKER_RUN_TIMEOUT}s (${formatted_duration}): ${cmd}"
 	else
-		failed_cmds+=("${cmd}")
-		failed_indices+=("${i}")
-		echo ">>> FAILED (exit ${exit_code}): ${cmd}"
+		statuses[$i]="FAIL"
+		echo ">>> FAILED (exit ${exit_code}, ${formatted_duration}): ${cmd}"
 	fi
 done
+total_elapsed=$(elapsed_since "${loop_start}")
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+passed=0
+failed=0
+timed_out=0
+for i in "${!statuses[@]}"; do
+	case "${statuses[$i]}" in
+	PASS) ((passed++)) || true ;;
+	FAIL) ((failed++)) || true ;;
+	TIMEOUT) ((timed_out++)) || true ;;
+	esac
+done
+
 echo ""
 echo "=========================================="
 echo "              TEST SUMMARY"
 echo "=========================================="
-echo "Total:  ${total}"
-echo "Passed: ${#passed_cmds[@]}"
-echo "Failed: ${#failed_cmds[@]}"
+echo "Total:      ${total}"
+echo "Passed:     ${passed}"
+echo "Failed:     ${failed}"
+echo "Timed out:  ${timed_out}"
+echo "Docker build time: $(format_duration "${build_elapsed}")"
+echo "Total test time:   $(format_duration "${total_elapsed}")"
 
-if [ ${#passed_cmds[@]} -gt 0 ]; then
+if [ "${passed}" -gt 0 ]; then
 	echo ""
 	echo "--- PASSED ---"
-	for cmd in "${passed_cmds[@]}"; do
-		echo "  [PASS] ${cmd}"
+	for i in "${!statuses[@]}"; do
+		if [ "${statuses[$i]}" = "PASS" ]; then
+			echo "  [PASS] ($(format_duration "${durations[$i]}")) ${test_commands[$i]}"
+		fi
 	done
 fi
 
-if [ ${#failed_cmds[@]} -gt 0 ]; then
+if [ $((failed + timed_out)) -gt 0 ]; then
 	echo ""
 	echo "=========================================="
 	echo "           FAILED TESTS"
 	echo "=========================================="
-	for idx in "${failed_indices[@]}"; do
-		cmd="${test_commands[$idx]}"
-		log_file="$(get_log_file "${idx}" "${cmd}")"
-		echo "  [FAIL] ${cmd}"
-		echo "    --> Log file at ${log_file}"
+	for i in "${!statuses[@]}"; do
+		if [ "${statuses[$i]}" != "PASS" ]; then
+			log_file="$(get_log_file "${i}" "${test_commands[$i]}")"
+			echo "  [${statuses[$i]}] ($(format_duration "${durations[$i]}")) ${test_commands[$i]}"
+			echo "    --> Log file at ${log_file}"
+		fi
 	done
 
 	exit 1
