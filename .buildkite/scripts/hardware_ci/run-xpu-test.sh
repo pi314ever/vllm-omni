@@ -5,16 +5,18 @@
 set -ex
 
 image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT}"
-container_name="xpu_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
+container_name="xpu_${BUILDKITE_COMMIT}_$(
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 10
+    echo
+)"
 
 # Try building the docker image
 docker build -t ${image_name} -f docker/Dockerfile.xpu .
 
 # Setup cleanup
 remove_docker_container() {
-  docker rm -f "${container_name}" || true;
-  docker image rm -f "${image_name}" || true;
-  docker system prune -f || true;
+    docker image rm -f "${image_name}" || true
+    docker system prune -f || true
 }
 trap remove_docker_container EXIT
 
@@ -24,6 +26,7 @@ docker run \
     --net=host \
     --ipc=host \
     --privileged \
+    --rm \
     -v /dev/dri/by-path:/dev/dri/by-path \
     --entrypoint="" \
     -e "HF_TOKEN=${HF_TOKEN}" \
@@ -34,20 +37,10 @@ docker run \
     set -e
     echo $ZE_AFFINITY_MASK
     pip install tblib==3.1.0
-    cd /workspace/vllm-omni/tests
-    ls -la
-    pytest -v -s diffusion --ignore=diffusion/attention/test_attention_sp.py
-    pytest -v -s distributed
-    pytest -v -s e2e
-    pytest -v -s entrypoints
-    pytest -v -s model_executor
-    pytest -v -s worker
+    cd /workspace/vllm-omni
+    pytest -v -s tests/ \
+        --ignore=tests/benchmarks/test_serve_cli.py \
+        --ignore=tests/e2e/offline_inference/test_bagel_text2img.py \
+        --ignore=tests/e2e/offline_inference/test_qwen3_omni.py \
+        --ignore=tests/e2e/offline_inference/test_t2v_model.py
 '
-    # pytest -v -s v1/core
-    # pytest -v -s v1/engine
-    # pytest -v -s v1/sample --ignore=v1/sample/test_logprobs.py --ignore=v1/sample/test_logprobs_e2e.py
-    # pytest -v -s v1/worker --ignore=v1/worker/test_gpu_model_runner.py
-    # pytest -v -s v1/structured_output
-    # pytest -v -s v1/spec_decode --ignore=v1/spec_decode/test_max_len.py --ignore=v1/spec_decode/test_tree_attention.py --ignore=v1/spec_decode/test_speculators_eagle3.py
-    # pytest -v -s v1/kv_connector/unit --ignore=v1/kv_connector/unit/test_multi_connector.py --ignore=v1/kv_connector/unit/test_nixl_connector.py --ignore=v1/kv_connector/unit/test_example_connector.py --ignore=v1/kv_connector/unit/test_lmcache_integration.py
-    # pytest -v -s v1/test_serial_utils.py
