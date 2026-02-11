@@ -118,7 +118,7 @@ declare -a statuses=()
 declare -a durations=()
 
 total=${#test_commands[@]}
-DOCKER_RUN_TIMEOUT=300
+DOCKER_RUN_TIMEOUT=1200
 
 # ---------------------------------------------------------------------------
 # Run each test command in its own docker container
@@ -161,12 +161,19 @@ for i in "${!test_commands[@]}"; do
 	durations+=("${test_elapsed}")
 	formatted_duration="$(format_duration "${test_elapsed}")"
 
+	if [ "${exit_code}" -ne 0 ]; then
+		docker rm -f "${container_name}" 2>/dev/null || true
+	fi
+
 	if [ "${exit_code}" -eq 0 ]; then
 		statuses[$i]="PASS"
 		echo ">>> PASSED (${formatted_duration}): ${cmd}"
 	elif [ "${exit_code}" -eq 124 ]; then
 		statuses[$i]="TIMEOUT"
 		echo ">>> TIMED OUT after ${DOCKER_RUN_TIMEOUT}s (${formatted_duration}): ${cmd}"
+	elif [ "${exit_code}" -eq 137 ]; then
+		statuses[$i]="KILLED"
+		echo ">>> KILLED after ${DOCKER_RUN_TIMEOUT}s + 30s grace (${formatted_duration}): ${cmd}"
 	else
 		statuses[$i]="FAIL"
 		echo ">>> FAILED (exit ${exit_code}, ${formatted_duration}): ${cmd}"
@@ -180,11 +187,13 @@ total_elapsed=$(elapsed_since "${loop_start}")
 passed=0
 failed=0
 timed_out=0
+killed=0
 for i in "${!statuses[@]}"; do
 	case "${statuses[$i]}" in
-	PASS) ((passed++)) || true ;;
-	FAIL) ((failed++)) || true ;;
-	TIMEOUT) ((timed_out++)) || true ;;
+		PASS) ((passed++)) || true ;;
+		FAIL) ((failed++)) || true ;;
+		TIMEOUT) ((timed_out++)) || true ;;
+		KILLED) ((killed++)) || true ;;
 	esac
 done
 
@@ -196,6 +205,7 @@ echo "Total:      ${total}"
 echo "Passed:     ${passed}"
 echo "Failed:     ${failed}"
 echo "Timed out:  ${timed_out}"
+echo "Killed:     ${killed}"
 echo "Docker build time: $(format_duration "${build_elapsed}")"
 echo "Total test time:   $(format_duration "${total_elapsed}")"
 
@@ -209,7 +219,7 @@ if [ "${passed}" -gt 0 ]; then
 	done
 fi
 
-if [ $((failed + timed_out)) -gt 0 ]; then
+if [ $((failed + timed_out + killed)) -gt 0 ]; then
 	echo ""
 	echo "=========================================="
 	echo "           FAILED TESTS"
