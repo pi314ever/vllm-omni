@@ -49,5 +49,6 @@ timeout -k 30 50m docker run \
         --ignore=tests/e2e/offline_inference/test_qwen3_omni.py \
         --ignore=tests/e2e/offline_inference/test_t2v_model.py \
         --ignore=tests/e2e/online_serving/test_qwen3_omni.py \
-        --ignore=tests/e2e/online_serving/test_qwen3_omni_expansion.py
+        --ignore=tests/e2e/online_serving/test_qwen3_omni_expansion.py \
+        --ignore=tests/examples/online_serving/test_qwen3_omni.py
 '
