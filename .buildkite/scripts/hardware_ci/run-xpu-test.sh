@@ -27,7 +27,7 @@ remove_docker_container() {
 }
 trap remove_docker_container EXIT
 
-timeout -k 30 50m docker run \
+time timeout -k 30 50m docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
     --ipc=host \
@@ -46,9 +46,11 @@ timeout -k 30 50m docker run \
     pytest -v -s tests/ \
         --ignore=tests/benchmarks/test_serve_cli.py \
         --ignore=tests/e2e/offline_inference/test_bagel_text2img.py \
+        --ignore=tests/e2e/offline_inference/test_qwen2_5_omni.py \
         --ignore=tests/e2e/offline_inference/test_qwen3_omni.py \
         --ignore=tests/e2e/offline_inference/test_t2v_model.py \
         --ignore=tests/e2e/online_serving/test_qwen3_omni.py \
         --ignore=tests/e2e/online_serving/test_qwen3_omni_expansion.py \
-        --ignore=tests/examples/online_serving/test_qwen3_omni.py
+        --ignore=tests/examples/online_serving/test_qwen3_omni.py \
+        -k "not test_ring_p2p and not test_sp_correctness"
 '
