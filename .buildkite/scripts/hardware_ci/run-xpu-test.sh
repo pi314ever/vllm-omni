@@ -34,8 +34,8 @@ time timeout -k 30 50m docker run \
     --privileged \
     -v /dev/dri/by-path:/dev/dri/by-path \
     --entrypoint="" \
-    -e "HF_TOKEN=${HF_TOKEN}" \
-    -e "ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK}" \
+    -e HF_TOKEN \
+    -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
