@@ -28,11 +28,16 @@ remove_docker_container() {
 }
 trap remove_docker_container EXIT
 
+HF_CACHE="$(realpath ~)/huggingface"
+mkdir -p "${HF_CACHE}"
+HF_MOUNT="/root/.cache/huggingface"
+
 time timeout -k 30 50m docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
     --ipc=host \
     -v /dev/dri/by-path:/dev/dri/by-path \
+    -v "${HF_CACHE}:${HF_MOUNT}" \
     --entrypoint="" \
     -e HF_TOKEN \
     -e ZE_AFFINITY_MASK \
