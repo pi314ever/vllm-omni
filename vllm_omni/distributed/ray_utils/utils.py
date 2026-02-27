@@ -181,7 +181,7 @@ def start_ray_actor(
     return worker_actor, task_ref
 
 
-def check_ray_task_alive(task_ref: Any, **kwargs):
+def is_ray_task_alive(task_ref: Any, **kwargs):
     """Checks ray task status. Returns FALSE if ray task has exited for any reason."""
     if not RAY_AVAILABLE:
         raise ImportError("ray is required to query ray tasks")
