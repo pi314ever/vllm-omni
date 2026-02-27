@@ -691,10 +691,16 @@ class OmniStage:
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
         """
         assert self._out_q is not None
+        if self._proc is not None and not self._proc.is_alive():
+            raise RuntimeError("OmniStage Worker process died unexpectedly")
         try:
             return self._out_q.get_nowait()
-        except Exception:
+        except queue.Empty:
             return None
+        except Exception as e:
+            logger.error("Unexpected error when collecting OmniStage output queue:", exc_info=e)
+            self.stop_stage_worker()
+            raise
 
     def process_engine_inputs(
         self,
