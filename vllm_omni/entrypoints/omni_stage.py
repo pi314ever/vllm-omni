@@ -693,7 +693,7 @@ class OmniStage:
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
         """
         assert self._out_q is not None
-        if self._ray_task_ref is not None and is_ray_task_alive(self._ray_task_ref, timeout=0):
+        if self._ray_task_ref is not None and not is_ray_task_alive(self._ray_task_ref, timeout=0):
             raise RuntimeError("OmniStage Ray actor died unexpectedly")
         try:
             return self._out_q.get_nowait()
