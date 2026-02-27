@@ -36,7 +36,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors import build_stage_connectors
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
-from vllm_omni.distributed.ray_utils.utils import kill_ray_actor, start_ray_actor
+from vllm_omni.distributed.ray_utils.utils import is_ray_task_alive, kill_ray_actor, start_ray_actor
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs, OmniEngineArgs
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
@@ -303,6 +303,8 @@ class OmniStage:
         self._in_q: mp.queues.Queue | ZmqQueue | str | None = None
         self._out_q: mp.queues.Queue | ZmqQueue | str | None = None
         self._proc: mp.Process | None = None
+        self._ray_actor: Any | None = None
+        self._ray_task_ref: Any | None = None
         self._shm_threshold_bytes: int = 65536
         self._stage_init_timeout: int = stage_init_timeout
         # Callback used by the orchestrator's output handler to stash
@@ -544,7 +546,7 @@ class OmniStage:
             os.environ["VLLM_LOGGING_PREFIX"] = new_env
             if worker_backend == "ray":
                 if is_async:
-                    self._ray_actor = start_ray_actor(
+                    self._ray_actor, self._ray_task_ref = start_ray_actor(
                         _stage_worker_async_entry,
                         ray_placement_group,
                         self.stage_id,
@@ -556,7 +558,7 @@ class OmniStage:
                         stage_init_timeout=self._stage_init_timeout,
                     )
                 else:
-                    self._ray_actor = start_ray_actor(
+                    self._ray_actor, self._ray_task_ref = start_ray_actor(
                         _stage_worker,
                         ray_placement_group,
                         self.stage_id,
@@ -629,7 +631,7 @@ class OmniStage:
                     pass
             self._out_q = None
 
-        if hasattr(self, "_ray_actor") and self._ray_actor:
+        if self._ray_actor is not None:
             kill_ray_actor(self._ray_actor)
             self._ray_actor = None
         elif self._proc is not None:
@@ -691,6 +693,8 @@ class OmniStage:
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
         """
         assert self._out_q is not None
+        if self._ray_task_ref is not None and is_ray_task_alive(self._ray_task_ref, timeout=0):
+            raise RuntimeError("OmniStage Ray actor died unexpectedly")
         try:
             return self._out_q.get_nowait()
         except queue.Empty:
