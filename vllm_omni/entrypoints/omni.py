@@ -575,7 +575,9 @@ class OmniBase:
 
         formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
 
-        logger.warning(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
+        logger.error(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
+        self.close()
+        raise TimeoutError
 
     def _is_profiler_enabled(self, stage_id: int) -> bool:
         """Check if profiler config is set for a given stage."""
