@@ -566,7 +566,8 @@ class OmniBase:
         )
 
         suggestions = [
-            f"Ignore this warning if the model weight download / load from disk time is longer than {timeout}s.",
+            f"If model weight download / load from disk takes longer than {timeout}s, "
+            "please increase initialization wait time (stage_init_timeout or call-site timeout)",
             "Verify GPU/device assignment in config (runtime.devices) is correct.",
             "Check GPU/host memory availability; reduce model or batch size if needed.",
             "Check model weights path and network reachability (if loading remotely).",
@@ -578,7 +579,7 @@ class OmniBase:
         logger.error(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
         self.close()
         raise TimeoutError(
-            f"{self._name}: {len(self._stages_ready)}/{num_stages} stages ready after {timeout}s"
+            f"{self._name}: {len(self._stages_ready)}/{num_stages} stages ready after {timeout}s. Missing stages: {not_ready}"
         )
 
     def _is_profiler_enabled(self, stage_id: int) -> bool:
