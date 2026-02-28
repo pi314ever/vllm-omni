@@ -1192,10 +1192,9 @@ def test_wait_for_stages_ready_timeout(monkeypatch: pytest.MonkeyPatch, mocker: 
 
     from vllm_omni.entrypoints.omni import Omni
 
-    # Use very short timeout
-    omni = Omni(model=MODEL, init_timeout=0.01)
-    # Verify that no stages are ready
-    assert len(omni._stages_ready) == 0
+    with pytest.raises(TimeoutError):
+        # Use very short timeout
+        Omni(model=MODEL, init_timeout=0.01)
 
 
 def test_generate_handles_error_messages(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
