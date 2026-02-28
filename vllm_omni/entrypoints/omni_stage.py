@@ -634,7 +634,9 @@ class OmniStage:
         if self._ray_actor is not None:
             kill_ray_actor(self._ray_actor)
             self._ray_actor = None
-        elif self._proc is not None:
+            kill_ray_actor(self._ray_actor)
+            self._ray_actor = None
+            self._ray_task_ref = None
             try:
                 self._proc.join(timeout=5)
             except Exception as e:
