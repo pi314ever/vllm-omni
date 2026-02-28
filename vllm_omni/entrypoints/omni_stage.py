@@ -700,7 +700,7 @@ class OmniStage:
             self.stop_stage_worker()
             raise
         if self._proc is not None and not self._proc.is_alive():
-            raise RuntimeError("OmniStage Worker process died unexpectedly")
+            raise RuntimeError(f"OmniStage Worker process died unexpectedly with exit code {self._proc.exitcode}")
 
     def process_engine_inputs(
         self,
