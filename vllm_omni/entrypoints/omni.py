@@ -579,7 +579,8 @@ class OmniBase:
         logger.error(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
         self.close()
         raise TimeoutError(
-            f"{self._name}: {len(self._stages_ready)}/{num_stages} stages ready after {timeout}s. Missing stages: {not_ready}"
+            f"{self._name}: {len(self._stages_ready)}/{num_stages} stages ready after {timeout}s. "
+            f"Missing stages: {not_ready}"
         )
 
     def _is_profiler_enabled(self, stage_id: int) -> bool:
