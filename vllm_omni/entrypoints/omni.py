@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import json
 import multiprocessing as mp
 import os
@@ -9,6 +10,7 @@ import uuid
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
 
 import huggingface_hub
@@ -138,6 +140,67 @@ def omni_snapshot_download(model_id) -> str:
     return model_id
 
 
+@dataclass
+class BackgroundResources:
+    stage_list: list[OmniStage] = field(default_factory=list)
+    _stage_in_queues: list[Any] = field(default_factory=list)
+    _stage_out_queues: list[Any] = field(default_factory=list)
+    _ray_pg = None
+    _zmq_ctx: zmq.Context | None = None
+    _handshake_stop: threading.Event | None = None
+    _zmq_handshake_socket: zmq.Socket | zmq.asyncio.Socket | None = None  # type: ignore[name-defined]
+    _handshake_thread: threading.Thread | None = None
+
+    # Async Omni Resources
+    output_handler: asyncio.Task | None = None
+
+    # Set if any stages are dead
+    stage_dead: bool = False
+
+    def __call__(self):
+        """Cleanup all background resources"""
+        self.stage_dead = True
+
+        for q in self._stage_in_queues:
+            try:
+                q.put_nowait(SHUTDOWN_TASK)
+            except Exception as e:
+                logger.warning("Failed to send shutdown signal to stage input queue: ", exc_info=e)
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+        for q in self._stage_out_queues:
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+        for stage in self.stage_list:
+            try:
+                stage.stop_stage_worker()
+            except Exception as e:
+                logger.warning("Failed to stop stage worker: ", exc_info=e)
+
+        try_close_ray(self._ray_pg)
+
+        # Gracefully shutdown handshake server thread
+        if self._handshake_stop is not None:
+            self._handshake_stop.set()
+        if self._handshake_thread is not None:
+            self._handshake_thread.join(timeout=2.0)
+            if self._handshake_thread.is_alive():
+                logger.warning("Handshake server thread did not terminate gracefully within timeout")
+
+        if self.output_handler is not None:
+            self.output_handler.cancel()
+
+        # Close ZMQ resources after thread has exited
+        if self._zmq_handshake_socket is not None:
+            self._zmq_handshake_socket.close(0)
+        if self._zmq_ctx is not None:
+            self._zmq_ctx.term()
+
+
 class OmniBase:
     """Base class for serving Omni models.
 
@@ -188,6 +251,10 @@ class OmniBase:
         # RPC results storage: {stage_id: {rpc_id: result}}
         # Used by collective_rpc to retrieve results collected from the output queue
         self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
+
+        # Set up cleanup finalizer
+        self.resources = BackgroundResources()
+        self._weak_finalizer = weakref.finalize(self, self.resources)
 
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
