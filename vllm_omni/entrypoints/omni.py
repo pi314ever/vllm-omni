@@ -39,6 +39,7 @@ from vllm_omni.distributed.ray_utils.utils import (
     try_close_ray,
 )
 from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -60,52 +61,6 @@ from vllm_omni.outputs import OmniRequestOutput
 _R = TypeVar("_R")
 
 logger = init_logger(__name__)
-
-
-def _weak_close_cleanup(
-    stage_list,
-    stage_in_queues,
-    stage_out_queues,
-    ray_pg,
-    zmq_ctx=None,
-    handshake_stop: threading.Event | None = None,
-    zmq_handshake_socket: zmq.Socket | None = None,
-    handshake_thread: threading.Thread | None = None,
-):
-    """Weak reference cleanup function for OmniBase instances."""
-    if stage_list:
-        for q in stage_in_queues:
-            try:
-                q.put_nowait(SHUTDOWN_TASK)
-            except Exception as e:
-                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
-            close_fn = getattr(q, "close", None)
-            if callable(close_fn):
-                close_fn()
-        for q in stage_out_queues:
-            close_fn = getattr(q, "close", None)
-            if callable(close_fn):
-                close_fn()
-        for stage in stage_list:
-            try:
-                stage.stop_stage_worker()
-            except Exception as e:
-                logger.warning(f"Failed to stop stage worker: {e}")
-    try_close_ray(ray_pg)
-
-    # Gracefully shutdown handshake server thread
-    if handshake_stop is not None:
-        handshake_stop.set()
-    if handshake_thread is not None:
-        handshake_thread.join(timeout=2.0)
-        if handshake_thread.is_alive():
-            logger.warning("Handshake server thread did not terminate gracefully within timeout")
-
-    # Close ZMQ resources after thread has exited
-    if zmq_handshake_socket is not None:
-        zmq_handshake_socket.close(0)
-    if zmq_ctx is not None:
-        zmq_ctx.term()
 
 
 def _dummy_snapshot_download(model_id):
@@ -147,9 +102,10 @@ class BackgroundResources:
     _stage_out_queues: list[Any] = field(default_factory=list)
     _ray_pg = None
     _zmq_ctx: zmq.Context | None = None
-    _handshake_stop: threading.Event | None = None
     _zmq_handshake_socket: zmq.Socket | zmq.asyncio.Socket | None = None  # type: ignore[name-defined]
+    _handshake_stop: threading.Event | None = None
     _handshake_thread: threading.Thread | None = None
+    _inline_engine: OmniDiffusion | None = None
 
     # Async Omni Resources
     output_handler: asyncio.Task | None = None
@@ -160,6 +116,12 @@ class BackgroundResources:
     def __call__(self):
         """Cleanup all background resources"""
         self.stage_dead = True
+
+        if self._inline_engine is not None:
+            try:
+                self._inline_engine.close()
+            except Exception as e:
+                logger.warning("Failed to close inline diffusion engine: %s", e)
 
         for q in self._stage_in_queues:
             try:
@@ -228,19 +190,11 @@ class OmniBase:
         kwargs["model"] = model
 
         # Stage management attributes
-        self.stage_list: list[OmniStage] = []
-        self._stage_in_queues: list[Any] = []
-        self._stage_out_queues: list[Any] = []
         self._stages_ready: set[int] = set()
-        self._ray_pg = None
         self._queue_cls = None
         self._ctx = None
-        self._zmq_ctx: zmq.Context | None = None
         self._zmq_master_address: str | None = None
         self._zmq_master_port: int | None = None
-        self._zmq_handshake_socket: zmq.Socket | None = None
-        self._handshake_thread: threading.Thread | None = None
-        self._handshake_stop: threading.Event | None = None
         self._handshake_endpoints: dict[int, tuple[str, str]] = {}
         self._handshake_seen: set[int] = set()  # Track which stage IDs have completed ZMQ handshake
         self._single_stage_id: int | None = None  # Optional: deploy only a specific stage ID
@@ -259,8 +213,22 @@ class OmniBase:
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
         # based on stage_type in YAML config (handled in omni_stage.py)
-        logger.info(f"Initializing stages for model: {model}")
-        self._initialize_stages(model, kwargs)
+        success = False
+        try:
+            logger.info(f"Initializing stages for model: {model}")
+            self._initialize_stages(model, kwargs)
+            success = True
+        finally:
+            if not success:
+                self._weak_finalizer()
+
+    @property
+    def stage_list(self) -> list[OmniStage]:
+        return self.resources.stage_list
+
+    @property
+    def output_handler(self) -> asyncio.Task | None:
+        return self.resources.output_handler
 
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
@@ -373,7 +341,6 @@ class OmniBase:
     def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
         """Initialize stage list management."""
         self._inline_diffusion = False
-        self._inline_engine = None
 
         stage_init_timeout = kwargs.get("stage_init_timeout", 20)
         shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
@@ -417,10 +384,10 @@ class OmniBase:
             for fut in as_completed(futures):
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
-        self.stage_list = [st for _, st in results]
-        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
-        self.output_modalities = [st.final_output_type for st in self.stage_list]
-        logger.info(f"[{self._name}] Loaded {len(self.stage_list)} stages")
+        self.resources.stage_list = [st for _, st in results]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.resources.stage_list]
+        self.output_modalities = [st.final_output_type for st in self.resources.stage_list]
+        logger.info(f"[{self._name}] Loaded {len(self.resources.stage_list)} stages")
 
         # Phase 1 optimization: for a single diffusion stage in async mode,
         # run the engine directly in the orchestrator process to eliminate
@@ -485,7 +452,7 @@ class OmniBase:
 
         cfg_kv_collect_func = load_func_from_config(getattr(stage_config, "cfg_kv_collect_func", None))
 
-        self._inline_engine = OmniDiffusion(
+        self.resources._inline_engine = OmniDiffusion(
             model=model,
             stage_id=stage_id,
             engine_input_source=getattr(stage_config, "engine_input_source", []),
@@ -515,13 +482,13 @@ class OmniBase:
         """Start all stage processes."""
         if self.worker_backend == "ray":
             # Initialize Ray Cluster
-            self._ray_pg = create_placement_group(
-                number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
+            self.resources._ray_pg = create_placement_group(
+                number_of_stages=len(self.resources.stage_list), address=self.ray_address, strategy="PACK"
             )
         else:
             # Initialize ZMQ context
-            if self._zmq_ctx is None:
-                self._zmq_ctx = zmq.Context()
+            if self.resources._zmq_ctx is None:
+                self.resources._zmq_ctx = zmq.Context()
 
             # Allocate endpoints for each stage
             total_stages = len(self.stage_configs)
@@ -541,17 +508,17 @@ class OmniBase:
             # Start handshake server
             self.start_handshake_server()
 
-        for stage_id, stage in enumerate[OmniStage](self.stage_list):
+        for stage_id, stage in enumerate[OmniStage](self.resources.stage_list):
             if self.worker_backend == "ray":
                 in_q = self._queue_cls()
                 out_q = self._queue_cls()
             else:
                 in_endpoint, out_endpoint = self._handshake_endpoints[stage_id]
-                in_q = ZmqQueue(self._zmq_ctx, zmq.PUSH, bind=in_endpoint)
-                out_q = ZmqQueue(self._zmq_ctx, zmq.PULL, bind=out_endpoint)
+                in_q = ZmqQueue(self.resources._zmq_ctx, zmq.PUSH, bind=in_endpoint)
+                out_q = ZmqQueue(self.resources._zmq_ctx, zmq.PULL, bind=out_endpoint)
 
-            self._stage_in_queues.append(in_q)
-            self._stage_out_queues.append(out_q)
+            self.resources._stage_in_queues.append(in_q)
+            self.resources._stage_out_queues.append(out_q)
             stage.attach_queues(in_q, out_q)
 
             stage_connectors_config = get_stage_connector_config(
@@ -585,7 +552,7 @@ class OmniBase:
                 batch_timeout=self.batch_timeout,
                 connectors_config=stage_connectors_config,
                 worker_backend=self.worker_backend,
-                ray_placement_group=self._ray_pg,
+                ray_placement_group=self.resources._ray_pg,
                 ignore_runtime_config=True if self._single_stage_id is not None else False,
             )
 
@@ -600,14 +567,14 @@ class OmniBase:
         if self._single_stage_id is not None and self.worker_backend != "ray":
             timeout = self._wait_for_handshakes(timeout)
 
-        num_stages = len(self.stage_list)
+        num_stages = len(self.resources.stage_list)
         deadline = time.time() + max(0, int(timeout))
 
         logger.info(f"[{self._name}] Waiting for {num_stages} stages to initialize (timeout: {timeout}s)")
 
         while len(self._stages_ready) < num_stages and time.time() < deadline:
             progressed = False
-            for stage_id, stage in enumerate(self.stage_list):
+            for stage_id, stage in enumerate(self.resources.stage_list):
                 if stage_id in self._stages_ready:
                     continue
 
@@ -644,7 +611,6 @@ class OmniBase:
         formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
 
         logger.error(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
-        self.close()
         raise TimeoutError(
             f"{self._name}: {len(self._stages_ready)}/{num_stages} stages ready after {timeout}s. "
             f"Missing stages: {not_ready}"
@@ -797,10 +763,10 @@ class OmniBase:
             >>> omni.start_profile(stages=[0, 2])
         """
         if stages is None:
-            stages = list(range(len(self.stage_list)))
+            stages = list(range(len(self.resources.stage_list)))
 
         for stage_id in stages:
-            if stage_id < len(self.stage_list):
+            if stage_id < len(self.resources.stage_list):
                 if not self._is_profiler_enabled(stage_id):
                     logger.info(
                         "[%s] Skipping start_profile for stage-%s: profiler config not set",
@@ -809,7 +775,7 @@ class OmniBase:
                     )
                     continue
                 try:
-                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
+                    self.resources.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
                     logger.info("[%s] Sent start_profile to stage-%s", self._name, stage_id)
                 except Exception as e:
                     logger.warning(
@@ -825,12 +791,12 @@ class OmniBase:
         the file paths for traces and tables.
         """
         if stages is None:
-            stages = list(range(len(self.stage_list)))
+            stages = list(range(len(self.resources.stage_list)))
 
         all_results = {"traces": [], "tables": []}
 
         for stage_id in stages:
-            if stage_id < len(self.stage_list):
+            if stage_id < len(self.resources.stage_list):
                 if not self._is_profiler_enabled(stage_id):
                     logger.info(
                         "[%s] Skipping stop_profile for stage-%s: profiler config not set",
@@ -937,20 +903,22 @@ class OmniBase:
     def _run_handshake_server_loop(self) -> None:
         """Main loop for handshake server - polls for messages and responds."""
         poller = zmq.Poller()
-        poller.register(self._zmq_handshake_socket, zmq.POLLIN)
+        poller.register(self.resources._zmq_handshake_socket, zmq.POLLIN)
 
         try:
-            while not self._handshake_stop.is_set():
+            while not self.resources._handshake_stop.is_set():
                 events = poller.poll(1000)
-                has_message = any(sock == self._zmq_handshake_socket and event == zmq.POLLIN for sock, event in events)
+                has_message = any(
+                    sock == self.resources._zmq_handshake_socket and event == zmq.POLLIN for sock, event in events
+                )
                 if not has_message:
                     continue
 
-                msg = msgspec.msgpack.decode(self._zmq_handshake_socket.recv())
+                msg = msgspec.msgpack.decode(self.resources._zmq_handshake_socket.recv())
                 response = msgspec.msgpack.encode(self._process_handshake_message(msg))
-                self._zmq_handshake_socket.send(response)
+                self.resources._zmq_handshake_socket.send(response)
         finally:
-            poller.unregister(self._zmq_handshake_socket)
+            poller.unregister(self.resources._zmq_handshake_socket)
 
     def start_handshake_server(self) -> None:
         """Start the ZMQ handshake server.
@@ -960,7 +928,7 @@ class OmniBase:
         Skips starting if the server is already running or ZMQ is not initialized.
         """
         # Skip if already running or ZMQ not initialized
-        if self._handshake_thread is not None or self._zmq_ctx is None:
+        if self.resources._handshake_thread is not None or self.resources._zmq_ctx is None:
             return
 
         # Skip if master address/port not configured
@@ -972,14 +940,16 @@ class OmniBase:
             local_only=False, host=self._zmq_master_address, port=int(self._zmq_master_port)
         )
 
-        self._handshake_stop = threading.Event()
-        self._zmq_handshake_socket = make_zmq_socket(self._zmq_ctx, endpoint, zmq.REP, bind=True, linger=5000)
+        self.resources._handshake_stop = threading.Event()
+        self.resources._zmq_handshake_socket = make_zmq_socket(
+            self.resources._zmq_ctx, endpoint, zmq.REP, bind=True, linger=5000
+        )
 
         # Start server thread
-        self._handshake_thread = threading.Thread(
+        self.resources._handshake_thread = threading.Thread(
             target=self._run_handshake_server_loop, daemon=True, name="zmq-handshake-server"
         )
-        self._handshake_thread.start()
+        self.resources._handshake_thread.start()
 
     def _wait_for_handshakes(self, timeout: int = 120) -> int:
         """Wait for handshakes from all expected stages.
@@ -1055,23 +1025,6 @@ class Omni(OmniBase):
         >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
         >>> print(outputs)
     """
-
-    def __init__(self, model: str, **kwargs: Any) -> None:
-        super().__init__(model, **kwargs)
-
-        # Register weak reference cleanup (called on garbage collection)
-        self._weak_finalizer = weakref.finalize(
-            self,
-            _weak_close_cleanup,
-            self.stage_list,
-            self._stage_in_queues,
-            self._stage_out_queues,
-            self._ray_pg,
-            self._zmq_ctx,
-            self._handshake_stop,
-            self._zmq_handshake_socket,
-            self._handshake_thread,
-        )
 
     @overload
     def generate(
@@ -1172,10 +1125,12 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
-        if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
+        if len(sampling_params_list) != len(self.resources.stage_list):
+            raise ValueError(
+                f"Expected {len(self.resources.stage_list)} sampling params, got {len(sampling_params_list)}"
+            )
 
-        for i, (stage, sp) in enumerate(zip(self.stage_list, sampling_params_list)):
+        for i, (stage, sp) in enumerate(zip(self.resources.stage_list, sampling_params_list)):
             ExpectedSPType = OmniDiffusionSamplingParams if stage.stage_type == "diffusion" else SamplingParams
             if not isinstance(sp, ExpectedSPType):
                 raise ValueError(
@@ -1190,7 +1145,7 @@ class Omni(OmniBase):
             request_prompts = list(prompts)
 
         # Orchestrator keeps stage objects for input derivation
-        num_stages = len(self.stage_list)
+        num_stages = len(self.resources.stage_list)
 
         # Generate globally unique request IDs and map them to original prompts
         request_ids = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
@@ -1215,7 +1170,7 @@ class Omni(OmniBase):
             else:
                 prompt_modalities = None
             final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-                prompt_modalities, self.output_modalities, self.stage_list
+                prompt_modalities, self.output_modalities, self.resources.stage_list
             )
             final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
@@ -1244,7 +1199,7 @@ class Omni(OmniBase):
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
-            self.stage_list[0].submit(task)
+            self.resources.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
@@ -1280,7 +1235,7 @@ class Omni(OmniBase):
         )
         while completed_requests < total_requests:
             made_progress = False
-            for stage_id, stage in enumerate(self.stage_list):
+            for stage_id, stage in enumerate(self.resources.stage_list):
                 result = stage.try_collect()
                 if result is None:
                     continue
@@ -1435,7 +1390,7 @@ class Omni(OmniBase):
                             success = cfg.forward_parent_with_cfg(
                                 req_id,
                                 {"engine_outputs": engine_outputs, "stage_id": stage_id},
-                                self.stage_list,
+                                self.resources.stage_list,
                                 self.connectors,
                                 sampling_params_list,
                                 request_id_to_prompt,
@@ -1454,12 +1409,12 @@ class Omni(OmniBase):
                             cfg.defer_parent(req_id, engine_outputs, stage_id)
                         continue
 
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
+                    next_stage: OmniStage = self.resources.stage_list[next_stage_id]
                     try:
                         # Derive inputs for the next stage, record preprocess time
                         with metrics.stage_postprocess_timer(stage_id, req_id):
                             next_inputs = next_stage.process_engine_inputs(
-                                self.stage_list, [request_id_to_prompt[req_id]]
+                                self.resources.stage_list, [request_id_to_prompt[req_id]]
                             )
                     except Exception as e:
                         completed_requests += 1
@@ -1483,7 +1438,7 @@ class Omni(OmniBase):
                             next_inputs=next_inputs,
                             sampling_params=sp_next,
                             original_prompt=request_id_to_prompt[req_id],
-                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                            next_stage_queue_submit_fn=self.resources.stage_list[next_stage_id].submit,
                             metrics=metrics,
                         )
 
