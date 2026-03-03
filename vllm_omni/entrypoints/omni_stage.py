@@ -36,7 +36,12 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors import build_stage_connectors
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
-from vllm_omni.distributed.ray_utils.utils import is_ray_task_alive, kill_ray_actor, start_ray_actor
+from vllm_omni.distributed.ray_utils.utils import (
+    get_ray_task_error,
+    is_ray_task_alive,
+    kill_ray_actor,
+    start_ray_actor,
+)
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs, OmniEngineArgs
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
@@ -704,7 +709,8 @@ class OmniStage:
         if self._proc is not None and not self._proc.is_alive():
             raise RuntimeError(f"OmniStage Worker process died unexpectedly with exit code {self._proc.exitcode}")
         if self._ray_task_ref is not None and not is_ray_task_alive(self._ray_task_ref, timeout=0):
-            raise RuntimeError("OmniStage Ray actor died unexpectedly")
+            e = get_ray_task_error(self._ray_task_ref, timeout=0)
+            raise RuntimeError("OmniStage Ray actor died unexpectedly") from e
 
     def process_engine_inputs(
         self,

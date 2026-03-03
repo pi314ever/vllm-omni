@@ -188,3 +188,14 @@ def is_ray_task_alive(task_ref: Any, **kwargs):
 
     ready, _ = ray.wait([task_ref], **kwargs)
     return not bool(ready)
+
+
+def get_ray_task_error(task_ref: Any, **kwargs) -> ray.exceptions.RayTaskError | None:
+    """Gets ray task. Returns RayTaskError if ray instance exited with any error, else None."""
+    if not RAY_AVAILABLE:
+        raise ImportError("ray is required to query ray tasks")
+
+    try:
+        ray.get(task_ref, **kwargs)
+    except ray.exceptions.RayTaskError as e:
+        return e
