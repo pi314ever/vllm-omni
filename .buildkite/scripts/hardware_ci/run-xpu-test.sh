@@ -38,6 +38,7 @@ time timeout -k 30 50m docker run \
     --ipc=host \
     -v /dev/dri/by-path:/dev/dri/by-path \
     -v "${HF_CACHE}:${HF_MOUNT}" \
+    --security-opt seccomp=unconfined \
     --entrypoint="" \
     -e HF_TOKEN \
     -e ZE_AFFINITY_MASK \
