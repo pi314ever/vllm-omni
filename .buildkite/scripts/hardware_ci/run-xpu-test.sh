@@ -53,6 +53,7 @@ time timeout -k 30 50m docker run \
     cd /workspace/vllm-omni
     pytest -v -s \
         tests/benchmarks/patch/test_patch.py \
+        tests/benchmarks/test_serve_cli.py \
         tests/comfyui/test_comfyui_integration.py \
         tests/diffusion/cache/test_cache_backends.py \
         tests/diffusion/distributed/test_cfg_parallel.py \
@@ -76,6 +77,7 @@ time timeout -k 30 50m docker run \
         tests/distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py \
         tests/distributed/omni_connectors/test_omni_connector_configs.py \
         tests/e2e/offline_inference/test_cache_dit.py \
+        tests/e2e/offline_inference/test_qwen2_5_omni.py \
         tests/e2e/offline_inference/test_t2i_model.py \
         tests/e2e/offline_inference/test_zimage_parallelism.py \
         tests/e2e/online_serving/test_images_generations_lora.py \
