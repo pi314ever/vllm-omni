@@ -15,7 +15,7 @@ stage_args:
     model_arch: Qwen3OmniMoeForConditionalGeneration
     worker_type: ar
     scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-    gpu_memory_utilization: 0.9 # thinker weight is around 61.08GB for Qwen3-Omni-30B-A3B-Instruct
+    gpu_memory_utilization: 0.85 # thinker weight is around 61.08GB for Qwen3-Omni-30B-A3B-Instruct
     skip_mm_profiling: true
     enforce_eager: true
     trust_remote_code: true
@@ -94,7 +94,6 @@ stage_args:
     max_num_batched_tokens: 100000
     hf_config_name: thinker_config
     async_scheduling: false
-    load_format: dummy
     max_cudagraph_capture_size: 0
   engine_input_source: [1]
   custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
