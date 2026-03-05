@@ -40,6 +40,8 @@ time timeout -k 30 50m docker run \
     -v "${HF_CACHE}:${HF_MOUNT}" \
     --security-opt seccomp=unconfined \
     --entrypoint="" \
+    -e VLLM_LOGGING_LEVEL \
+    -e VLLM_OMNI_LOGGING_LEVEL \
     -e HF_TOKEN \
     -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
