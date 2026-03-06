@@ -28,7 +28,7 @@ remove_docker_container() {
 }
 trap remove_docker_container EXIT
 
-HF_CACHE="$(realpath ~)/huggingface"
+HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
