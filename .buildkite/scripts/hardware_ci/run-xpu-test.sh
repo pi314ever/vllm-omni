@@ -77,8 +77,12 @@ time timeout -k 30 50m docker run \
         tests/distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py \
         tests/distributed/omni_connectors/test_omni_connector_configs.py \
         tests/e2e/offline_inference/test_cache_dit.py \
+        tests/e2e/offline_inference/test_diffusion_lora.py \
+        tests/e2e/offline_inference/test_mammoth_moda2.py \
         tests/e2e/offline_inference/test_qwen2_5_omni.py \
+        tests/e2e/offline_inference/test_stable_audio_model.py \
         tests/e2e/offline_inference/test_t2i_model.py \
+        tests/e2e/offline_inference/test_teacache.py \
         tests/e2e/offline_inference/test_zimage_parallelism.py \
         tests/e2e/online_serving/test_images_generations_lora.py \
         tests/engine/test_async_omni_engine_abort.py \
@@ -100,6 +104,9 @@ time timeout -k 30 50m docker run \
         tests/model_executor/models/qwen2_5_omni/test_audio_length.py \
         tests/model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py \
         tests/model_executor/models/qwen3_tts/test_cuda_graph_decoder.py \
+        tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py \
+        tests/model_executor/test_cosyvoice3_components.py \
+        tests/model_executor/test_cosyvoice3_utils.py \
         tests/test_outputs.py \
         tests/worker/test_gpu_generation_model_runner.py \
         tests/worker/test_omni_gpu_model_runner.py \
