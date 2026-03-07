@@ -32,7 +32,7 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
-time timeout -k 30 50m docker run \
+time timeout -k 30 30m docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
     --ipc=host \
