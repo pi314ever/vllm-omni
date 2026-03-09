@@ -105,8 +105,8 @@ time timeout -k 30 30m docker run \
         tests/model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py \
         tests/model_executor/models/qwen3_tts/test_cuda_graph_decoder.py \
         tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py \
-        tests/model_executor/test_cosyvoice3_components.py \
-        tests/model_executor/test_cosyvoice3_utils.py \
+        tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py \
+        tests/model_executor/models/cosyvoice3/test_cosyvoice3_utils.py \
         tests/test_outputs.py \
         tests/worker/test_gpu_generation_model_runner.py \
         tests/worker/test_omni_gpu_model_runner.py \
