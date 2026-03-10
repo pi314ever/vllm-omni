@@ -1370,14 +1370,24 @@ def test_dtype_normalization_valid_types(
     _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
-    from vllm_omni.entrypoints.omni import Omni
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni_stage.OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+        raising=False,
+    )
 
+    import vllm_omni.entrypoints.omni as omni_module
+
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
         _fake_loader,
         raising=False,
     )
+
+    from vllm_omni.entrypoints.omni import Omni
 
     omni = Omni(model="any", init_timeout=1, dtype=dtype)
 
@@ -1416,14 +1426,24 @@ def test_dtype_normalization_invalid_types(monkeypatch, mocker: MockerFixture, f
     _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
-    from vllm_omni.entrypoints.omni import Omni
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni_stage.OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+        raising=False,
+    )
 
+    import vllm_omni.entrypoints.omni as omni_module
+
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
         _fake_loader,
         raising=False,
     )
+
+    from vllm_omni.entrypoints.omni import Omni
 
     # Raise TypeError if we get an unrecognized type
     with pytest.raises(TypeError):
