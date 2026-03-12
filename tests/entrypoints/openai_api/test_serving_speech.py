@@ -1042,7 +1042,7 @@ class TestAsyncOmniSupportedTasks:
         omni.output_modalities = [None, "audio"]
         stage = MagicMock()
         stage.is_comprehension = False
-        omni.stage_list = [stage]
+        omni.resources.stage_list = [stage]
         tasks = await omni.get_supported_tasks()
         assert "generate" not in tasks
         assert "speech" in tasks
@@ -1058,7 +1058,7 @@ class TestAsyncOmniSupportedTasks:
         omni.output_modalities = ["text", None, "audio"]
         stage = MagicMock()
         stage.is_comprehension = True
-        omni.stage_list = [stage]
+        omni.resources.stage_list = [stage]
         tasks = await omni.get_supported_tasks()
         assert "generate" in tasks
 
