@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
+from vllm_omni.entrypoints.omni import BackgroundResources
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
@@ -1042,7 +1043,7 @@ class TestAsyncOmniSupportedTasks:
         omni.output_modalities = [None, "audio"]
         stage = MagicMock()
         stage.is_comprehension = False
-        omni.resources.stage_list = [stage]
+        omni.resources = BackgroundResources(stage_list=[stage])
         tasks = await omni.get_supported_tasks()
         assert "generate" not in tasks
         assert "speech" in tasks
@@ -1058,7 +1059,7 @@ class TestAsyncOmniSupportedTasks:
         omni.output_modalities = ["text", None, "audio"]
         stage = MagicMock()
         stage.is_comprehension = True
-        omni.resources.stage_list = [stage]
+        omni.resources = BackgroundResources(stage_list=[stage])
         tasks = await omni.get_supported_tasks()
         assert "generate" in tasks
 
