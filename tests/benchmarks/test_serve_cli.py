@@ -21,7 +21,7 @@ test_params = [
 
 @pytest.mark.core_model
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "L4"}, num_cards=3)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=3)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bench_serve_chat(omni_server):
     command = [
