@@ -742,7 +742,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
     @property
     def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1.0
+        return self._guidance_scale > 1.0 if self._guidance_scale is not None else False
 
     @property
     def num_timesteps(self):
