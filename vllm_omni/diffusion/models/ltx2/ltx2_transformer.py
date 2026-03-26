@@ -43,6 +43,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.debug_mem_logger import log_event, _tensor_stats
 
 logger = init_logger(__name__)
 
@@ -1650,6 +1651,21 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_coords[:, 0:1, :], device=audio_hidden_states.device
         )
 
+        # #region agent log
+        _do_nan_trace = not getattr(self, "_nan_traced", False)
+        if _do_nan_trace:
+            def _nc(name, t):
+                return {"name": name, "has_nan": bool(torch.isnan(t.float()).any()),
+                        "min": round(float(t.float().min()), 4), "max": round(float(t.float().max()), 4)}
+            _rope_check = {
+                "video_rotary_cos": _nc("v_rope_cos", video_rotary_emb[0]),
+                "video_rotary_sin": _nc("v_rope_sin", video_rotary_emb[1]),
+                "audio_rotary_cos": _nc("a_rope_cos", audio_rotary_emb[0]),
+                "audio_rotary_sin": _nc("a_rope_sin", audio_rotary_emb[1]),
+            }
+            log_event("ltx2_transformer:forward:after_rope", "RoPE embeddings computed", data=_rope_check, hypothesis_id="H9")
+        # #endregion
+
         # 2. Patchify input projections
         hidden_states = self.proj_in(hidden_states)
         audio_hidden_states = self.audio_proj_in(audio_hidden_states)
@@ -1669,6 +1685,16 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
         temb = temb.view(batch_size, -1, temb.size(-1))
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
+
+        # #region agent log
+        if _do_nan_trace:
+            log_event("ltx2_transformer:forward:after_proj_temb", "proj_in + time_embed done", data={
+                "hidden_states": _nc("hidden_states", hidden_states),
+                "audio_hidden_states": _nc("audio_hs", audio_hidden_states),
+                "temb": _nc("temb", temb),
+                "embedded_timestep": _nc("emb_ts", embedded_timestep),
+            }, hypothesis_id="H9")
+        # #endregion
 
         temb_audio, audio_embedded_timestep = self.audio_time_embed(
             audio_timestep.flatten(),
@@ -1716,8 +1742,23 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
         audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
+        # #region agent log
+        if _do_nan_trace:
+            log_event("ltx2_transformer:forward:before_blocks", "all pre-block tensors ready", data={
+                "hidden_states": _nc("hidden_states", hidden_states),
+                "audio_hidden_states": _nc("audio_hs", audio_hidden_states),
+                "encoder_hidden_states": _nc("enc_hs", encoder_hidden_states),
+                "audio_encoder_hidden_states": _nc("audio_enc_hs", audio_encoder_hidden_states),
+                "temb": _nc("temb", temb),
+                "temb_audio": _nc("temb_audio", temb_audio),
+                "v_cross_ss": _nc("v_cross_ss", video_cross_attn_scale_shift),
+                "a_cross_ss": _nc("a_cross_ss", audio_cross_attn_scale_shift),
+            }, hypothesis_id="H9")
+        # #endregion
+
         # 5. Run transformer blocks
-        for block in self.transformer_blocks:
+        _nan_found_at_block = -1
+        for _block_idx, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -1757,6 +1798,33 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     encoder_attention_mask,
                     audio_encoder_attention_mask,
                 )
+
+            # #region agent log
+            if _do_nan_trace and _nan_found_at_block < 0:
+                _v_nan = bool(torch.isnan(hidden_states).any())
+                _a_nan = bool(torch.isnan(audio_hidden_states).any())
+                if _v_nan or _a_nan:
+                    _nan_found_at_block = _block_idx
+                    log_event("ltx2_transformer:forward:nan_in_block", f"NaN first appeared in block {_block_idx}", data={
+                        "block_idx": _block_idx,
+                        "total_blocks": len(self.transformer_blocks),
+                        "video_nan": _v_nan,
+                        "audio_nan": _a_nan,
+                        "hidden_states": _tensor_stats(hidden_states, f"hs_block_{_block_idx}"),
+                        "audio_hidden_states": _tensor_stats(audio_hidden_states, f"audio_hs_block_{_block_idx}"),
+                    }, hypothesis_id="H9")
+            # #endregion
+
+        # #region agent log
+        if _do_nan_trace:
+            self._nan_traced = True
+            log_event("ltx2_transformer:forward:after_all_blocks", "all blocks done", data={
+                "nan_found_at_block": _nan_found_at_block,
+                "total_blocks": len(self.transformer_blocks),
+                "hidden_states": _nc("final_hs", hidden_states),
+                "audio_hidden_states": _nc("final_audio_hs", audio_hidden_states),
+            }, hypothesis_id="H9")
+        # #endregion
 
         # 6. Output layers (including unpatchification)
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
