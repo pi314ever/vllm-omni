@@ -175,11 +175,22 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             ),
         ]
 
+        # #region agent log
+        log_event("pipeline_ltx2.py:__init__:start", "LTX2Pipeline.__init__ started", data={
+            "device": str(self.device),
+            "dtype": str(dtype),
+            "model": str(model),
+        }, hypothesis_id="LOAD")
+        # #endregion
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
             subfolder="tokenizer",
             local_files_only=local_files_only,
         )
+        # #region agent log
+        log_event("pipeline_ltx2.py:__init__:after_tokenizer", "tokenizer loaded", hypothesis_id="LOAD")
+        # #endregion
         # prefer mmap loading as default device is cuda, and the output of text encoder
         # could be deterministic.
         with torch.device("cpu"):
@@ -189,12 +200,21 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 torch_dtype=dtype,
                 local_files_only=local_files_only,
             ).to(self.device)
+        # #region agent log
+        log_event("pipeline_ltx2.py:__init__:after_text_encoder_to_device", "text_encoder moved to device", data={
+            "text_encoder_device": str(next(self.text_encoder.parameters()).device),
+            "text_encoder_params_m": round(sum(p.numel() for p in self.text_encoder.parameters()) / 1e6, 1),
+        }, hypothesis_id="LOAD")
+        # #endregion
         self.connectors = LTX2TextConnectors.from_pretrained(
             model,
             subfolder="connectors",
             torch_dtype=dtype,
             local_files_only=local_files_only,
         ).to(self.device)
+        # #region agent log
+        log_event("pipeline_ltx2.py:__init__:after_connectors_to_device", "connectors moved to device", hypothesis_id="LOAD")
+        # #endregion
 
         self.vae = AutoencoderKLLTX2Video.from_pretrained(
             model,
@@ -202,18 +222,27 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             torch_dtype=dtype,
             local_files_only=local_files_only,
         ).to(self.device)
+        # #region agent log
+        log_event("pipeline_ltx2.py:__init__:after_vae_to_device", "vae moved to device", hypothesis_id="LOAD")
+        # #endregion
         self.audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
             model,
             subfolder="audio_vae",
             torch_dtype=dtype,
             local_files_only=local_files_only,
         ).to(self.device)
+        # #region agent log
+        log_event("pipeline_ltx2.py:__init__:after_audio_vae_to_device", "audio_vae moved to device", hypothesis_id="LOAD")
+        # #endregion
         self.vocoder = LTX2Vocoder.from_pretrained(
             model,
             subfolder="vocoder",
             torch_dtype=dtype,
             local_files_only=local_files_only,
         ).to(self.device)
+        # #region agent log
+        log_event("pipeline_ltx2.py:__init__:after_vocoder_to_device", "vocoder moved to device - ALL components now on GPU", hypothesis_id="LOAD")
+        # #endregion
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         self.transformer = create_transformer_from_config(transformer_config)

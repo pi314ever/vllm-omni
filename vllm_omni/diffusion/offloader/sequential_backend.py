@@ -12,6 +12,10 @@ from vllm_omni.platforms import current_omni_platform
 from .base import OffloadBackend, OffloadConfig
 from .module_collector import ModuleDiscovery
 
+# #region agent log
+from vllm_omni.diffusion.debug_mem_logger import log_event
+# #endregion
+
 logger = init_logger(__name__)
 
 
@@ -94,6 +98,12 @@ class SequentialOffloadHook(ModelHook):
         self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
+        # #region agent log
+        log_event("sequential_backend.py:pre_forward:before_offload", "offload hook: before CPU/GPU swap", data={
+            "module": module.__class__.__name__,
+            "offload_targets": [t.__class__.__name__ for t in self.offload_targets],
+        }, hypothesis_id="OFFLOAD")
+        # #endregion
         # Offload target modules to CPU
         for target in self.offload_targets:
             self._to_cpu(target)
@@ -101,6 +111,12 @@ class SequentialOffloadHook(ModelHook):
         # Load current module to GPU
         self._to_gpu(module)
         current_omni_platform.synchronize()
+
+        # #region agent log
+        log_event("sequential_backend.py:pre_forward:after_offload", "offload hook: after CPU/GPU swap", data={
+            "module_on_device": module.__class__.__name__,
+        }, hypothesis_id="OFFLOAD")
+        # #endregion
 
         logger.debug(
             "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
@@ -198,6 +214,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.warning("ModelLevelOffloadBackend already enabled")
             return
 
+        # #region agent log
+        log_event("sequential_backend.py:enable:start", "ModelLevelOffloadBackend.enable() called", hypothesis_id="OFFLOAD")
+        # #endregion
+
         modules = ModuleDiscovery.discover(pipeline)
         if not modules.dits:
             logger.warning("No DiT/transformer modules found, skipping model-level offloading")
@@ -205,6 +225,17 @@ class ModelLevelOffloadBackend(OffloadBackend):
         if not modules.encoders:
             logger.warning("No encoder modules found, skipping model-level offloading")
             return
+
+        # #region agent log
+        _all_attrs = [a for a in dir(pipeline) if not a.startswith('_') and isinstance(getattr(pipeline, a, None), nn.Module)]
+        log_event("sequential_backend.py:enable:modules_discovered", "modules discovered", data={
+            "dit_names": modules.dit_names,
+            "encoder_names": modules.encoder_names,
+            "vae_found": modules.vae is not None,
+            "all_module_attrs": _all_attrs,
+            "undiscovered_modules": [a for a in _all_attrs if a not in modules.dit_names and a not in modules.encoder_names and a != "vae"],
+        }, hypothesis_id="OFFLOAD")
+        # #endregion
 
         # Move encoders to GPU
         for enc in modules.encoders:
@@ -230,6 +261,13 @@ class ModelLevelOffloadBackend(OffloadBackend):
         self._offload_modules = [*modules.dits, *modules.encoders]
 
         self.enabled = True
+
+        # #region agent log
+        log_event("sequential_backend.py:enable:done", "offload hooks applied", data={
+            "dits_offloaded": modules.dit_names,
+            "encoders_offloaded": modules.encoder_names,
+        }, hypothesis_id="OFFLOAD")
+        # #endregion
 
         logger.info(
             "Model-level offloading enabled: %s <-> %s (mutual exclusion)",

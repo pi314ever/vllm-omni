@@ -188,6 +188,13 @@ class DiffusionModelRunner:
             else:
                 self.cache_backend.enable(self.pipeline)
 
+        # #region agent log
+        log_event("diffusion_model_runner.py:load_model:init_complete", "model runner init complete", data={
+            "offload_enabled": self.offload_backend is not None,
+            "cache_enabled": self.cache_backend is not None,
+            "enforce_eager": self.od_config.enforce_eager,
+        }, hypothesis_id="LOAD")
+        # #endregion
         logger.info("Model runner: Initialization complete.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
