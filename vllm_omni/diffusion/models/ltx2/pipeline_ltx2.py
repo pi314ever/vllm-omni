@@ -44,7 +44,7 @@ from .pipeline_ltx2_latent_upsample import LTX2LatentUpsamplePipeline
 logger = init_logger(__name__)
 
 # #region agent log
-from vllm_omni.diffusion.debug_mem_logger import log_event, increment_request, increment_step, log_gc_stats, _tensor_summary
+from vllm_omni.diffusion.debug_mem_logger import log_event, increment_request, increment_step, log_gc_stats, _tensor_summary, _tensor_stats
 # #endregion
 
 
@@ -384,7 +384,8 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         log_event("pipeline_ltx2.py:_get_gemma_prompt_embeds:after_stack", "after stacking hidden states", data={
             "stacked_shape": list(text_encoder_hidden_states.shape),
             "stacked_mib": round(text_encoder_hidden_states.nelement() * text_encoder_hidden_states.element_size() / (1024**2), 2),
-        }, hypothesis_id="C")
+            "embed_stats": _tensor_stats(text_encoder_hidden_states, "text_embeds"),
+        }, hypothesis_id="H3")
         # #endregion
         sequence_lengths = prompt_attention_mask.sum(dim=-1)
 
@@ -987,6 +988,13 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
             prompt_embeds, additive_attention_mask, additive_mask=True
         )
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:after_connectors", "connector embeddings ready", data={
+            "connector_embeds_stats": _tensor_stats(connector_prompt_embeds, "connector_prompt_embeds"),
+            "connector_audio_stats": _tensor_stats(connector_audio_prompt_embeds, "connector_audio_embeds"),
+            "cfg_parallel_ready": cfg_parallel_ready,
+        }, hypothesis_id="H3")
+        # #endregion
 
         # Compute negative prompt connectors when CFG is enabled
         negative_connector_prompt_embeds = None
@@ -1219,7 +1227,23 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 )
 
                 pbar.update()
+            # #region agent log
+            if i == 0 or i == len(timesteps) - 1:
+                log_event(f"pipeline_ltx2.py:forward:step_{i}_latent_stats", f"latent stats after step {i}", data={
+                    "step": i,
+                    "total_steps": len(timesteps),
+                    "latents_stats": _tensor_stats(latents, f"latents_step_{i}"),
+                    "audio_latents_stats": _tensor_stats(audio_latents, f"audio_latents_step_{i}"),
+                    "cfg_parallel_ready": cfg_parallel_ready,
+                }, hypothesis_id="H1")
+            # #endregion
 
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:after_denoise_loop", "denoising loop finished", data={
+            "latents_stats": _tensor_stats(latents, "latents_after_denoise"),
+            "audio_latents_stats": _tensor_stats(audio_latents, "audio_latents_after_denoise"),
+        }, hypothesis_id="H1")
+        # #endregion
         latents = self._unpack_latents(
             latents,
             latent_num_frames,
@@ -1231,6 +1255,11 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         latents = self._denormalize_latents(
             latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
         )
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:after_denormalize", "latents denormalized for VAE", data={
+            "latents_stats": _tensor_stats(latents, "latents_denormalized"),
+        }, hypothesis_id="H2")
+        # #endregion
 
         audio_latents = self._unpad_audio_latents(audio_latents, original_audio_num_frames)
         audio_latents = self._denormalize_audio_latents(
@@ -1269,8 +1298,26 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                                   [self.transformer, self.text_encoder,
                                    self.connectors, self.audio_vae, self.vocoder])
             latents = latents.to(self.vae.dtype)
+            # #region agent log
+            log_event("pipeline_ltx2.py:forward:before_vae_decode", "about to call vae.decode()", data={
+                "latents_stats": _tensor_stats(latents, "latents_to_vae"),
+                "vae_device": str(next(self.vae.parameters()).device),
+                "latents_device": str(latents.device),
+                "timestep": str(timestep) if timestep is not None else "None",
+            }, hypothesis_id="H2")
+            # #endregion
             video = self.vae.decode(latents, timestep, return_dict=False)[0]
+            # #region agent log
+            log_event("pipeline_ltx2.py:forward:after_vae_decode", "vae.decode() returned", data={
+                "video_stats": _tensor_stats(video, "video_raw"),
+            }, hypothesis_id="H2")
+            # #endregion
             video = self.video_processor.postprocess_video(video, output_type=output_type)
+            # #region agent log
+            log_event("pipeline_ltx2.py:forward:after_postprocess", "postprocess_video done", data={
+                "video_stats": _tensor_stats(video, "video_postprocessed"),
+            }, hypothesis_id="H4")
+            # #endregion
 
             self._swap_for_decode(self.audio_vae,
                                   [self.vae, self.transformer, self.text_encoder,

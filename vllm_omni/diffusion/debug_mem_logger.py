@@ -53,6 +53,30 @@ def _tensor_summary(t):
     }
 
 
+def _tensor_stats(t, name="tensor"):
+    """Summarize tensor shape AND value statistics for correctness debugging."""
+    if not isinstance(t, torch.Tensor):
+        if hasattr(t, 'shape'):
+            return {"name": name, "type": str(type(t)), "shape": list(t.shape),
+                    "min": float(t.min()), "max": float(t.max()), "mean": float(t.mean())}
+        return {"name": name, "type": str(type(t))}
+    ft = t.float()
+    return {
+        "name": name,
+        "shape": list(t.shape),
+        "dtype": str(t.dtype),
+        "device": str(t.device),
+        "min": round(float(ft.min()), 6),
+        "max": round(float(ft.max()), 6),
+        "mean": round(float(ft.mean()), 6),
+        "std": round(float(ft.std()), 6),
+        "has_nan": bool(torch.isnan(ft).any()),
+        "has_inf": bool(torch.isinf(ft).any()),
+        "all_zero": bool((ft == 0).all()),
+        "pct_zero": round(float((ft == 0).sum()) / max(ft.numel(), 1) * 100, 2),
+    }
+
+
 def _write_log(entry):
     """Append a single NDJSON line to the log file."""
     try:
