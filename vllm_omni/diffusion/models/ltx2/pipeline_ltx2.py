@@ -42,6 +42,10 @@ from .pipeline_ltx2_latent_upsample import LTX2LatentUpsamplePipeline
 
 logger = init_logger(__name__)
 
+# #region agent log
+from vllm_omni.diffusion.debug_mem_logger import log_event, increment_request, increment_step, log_gc_stats, _tensor_summary
+# #endregion
+
 
 def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
     """Load transformer config from model directory or HF Hub."""
@@ -335,11 +339,26 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         text_input_ids = text_input_ids.to(device)
         prompt_attention_mask = prompt_attention_mask.to(device)
 
+        # #region agent log
+        log_event("pipeline_ltx2.py:_get_gemma_prompt_embeds:before_text_encoder", "before text encoder forward", hypothesis_id="C")
+        # #endregion
         text_encoder_outputs = self.text_encoder(
             input_ids=text_input_ids, attention_mask=prompt_attention_mask, output_hidden_states=True
         )
         text_encoder_hidden_states = text_encoder_outputs.hidden_states
+        # #region agent log
+        log_event("pipeline_ltx2.py:_get_gemma_prompt_embeds:after_text_encoder", "after text encoder forward", data={
+            "num_hidden_layers": len(text_encoder_hidden_states),
+            "hidden_state_0": _tensor_summary(text_encoder_hidden_states[0]),
+        }, hypothesis_id="C")
+        # #endregion
         text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
+        # #region agent log
+        log_event("pipeline_ltx2.py:_get_gemma_prompt_embeds:after_stack", "after stacking hidden states", data={
+            "stacked_shape": list(text_encoder_hidden_states.shape),
+            "stacked_mib": round(text_encoder_hidden_states.nelement() * text_encoder_hidden_states.element_size() / (1024**2), 2),
+        }, hypothesis_id="C")
+        # #endregion
         sequence_lengths = prompt_attention_mask.sum(dim=-1)
 
         prompt_embeds = self._pack_text_embeds(
@@ -350,6 +369,12 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             scale_factor=scale_factor,
         )
         prompt_embeds = prompt_embeds.to(dtype=dtype)
+        # #region agent log
+        del text_encoder_outputs, text_encoder_hidden_states
+        log_event("pipeline_ltx2.py:_get_gemma_prompt_embeds:after_pack", "after packing and cleanup", data={
+            "prompt_embeds": _tensor_summary(prompt_embeds),
+        }, hypothesis_id="C")
+        # #endregion
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
@@ -778,6 +803,13 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     ) -> DiffusionOutput:
         # Extract prompt/negative_prompt from request.
         # Input format: req.prompts is a list of str or dict with "prompt"/"negative_prompt" keys.
+        # #region agent log
+        increment_request()
+        log_event("pipeline_ltx2.py:forward:entry", "forward() called", data={
+            "num_prompts": len(req.prompts) if req.prompts else 0,
+        }, hypothesis_id="B")
+        log_gc_stats("pipeline_ltx2.py:forward:entry")
+        # #endregion
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
@@ -995,8 +1027,22 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             self.scheduler.config.get("base_shift", 0.95),
             self.scheduler.config.get("max_shift", 2.05),
         )
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:before_deepcopy_scheduler", "before deepcopy scheduler", data={
+            "scheduler_type": type(self.scheduler).__name__,
+        }, hypothesis_id="A")
+        import sys as _sys_dc
+        _scheduler_id_before = id(self.scheduler)
+        # #endregion
         audio_scheduler = copy.deepcopy(self.scheduler)
         video_audio_scheduler = _VideoAudioScheduler(self.scheduler, audio_scheduler)
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:after_deepcopy_scheduler", "after deepcopy scheduler", data={
+            "original_id": _scheduler_id_before,
+            "copy_id": id(audio_scheduler),
+            "scheduler_size_bytes": _sys_dc.getsizeof(audio_scheduler),
+        }, hypothesis_id="A")
+        # #endregion
         _ = retrieve_timesteps(
             audio_scheduler,
             num_inference_steps,
@@ -1015,6 +1061,17 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         )
         self._num_timesteps = len(timesteps)
 
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:before_rope_coords", "before RoPE coord computation", data={
+            "latents": _tensor_summary(latents),
+            "audio_latents": _tensor_summary(audio_latents),
+            "latent_num_frames": latent_num_frames,
+            "latent_height": latent_height,
+            "latent_width": latent_width,
+            "num_timesteps": len(timesteps),
+            "do_cfg": self.do_classifier_free_guidance,
+        }, hypothesis_id="E")
+        # #endregion
         video_coords = self.transformer.rope.prepare_video_coords(
             latents.shape[0], latent_num_frames, latent_height, latent_width, latents.device, fps=frame_rate
         )
@@ -1023,6 +1080,12 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         )
         # No coord duplication needed: mixin handles CFG via separate forward calls,
         # not batch=2. Each forward gets batch=1 coords directly.
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:after_rope_coords", "after RoPE coord computation", data={
+            "video_coords": _tensor_summary(video_coords),
+            "audio_coords": _tensor_summary(audio_coords),
+        }, hypothesis_id="E")
+        # #endregion
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
@@ -1030,6 +1093,15 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                     continue
 
                 self._current_timestep = t
+                # #region agent log
+                increment_step()
+                if i == 0 or i == len(timesteps) - 1 or i == len(timesteps) // 2:
+                    log_event(f"pipeline_ltx2.py:forward:denoise_step_{i}", f"denoising step {i}/{len(timesteps)}", data={
+                        "timestep_value": float(t) if hasattr(t, 'item') else t,
+                        "latents": _tensor_summary(latents),
+                        "audio_latents": _tensor_summary(audio_latents),
+                    }, hypothesis_id="B")
+                # #endregion
 
                 latent_model_input = latents.to(prompt_embeds.dtype)
                 audio_latent_model_input = audio_latents.to(prompt_embeds.dtype)
@@ -1141,6 +1213,15 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
             audio = self.vocoder(generated_mel_spectrograms)
 
+        # #region agent log
+        log_event("pipeline_ltx2.py:forward:before_return", "forward() about to return", data={
+            "video_type": str(type(video)),
+            "audio_type": str(type(audio)),
+            "video_summary": _tensor_summary(video) if isinstance(video, torch.Tensor) else {"type": str(type(video))},
+            "audio_summary": _tensor_summary(audio) if isinstance(audio, torch.Tensor) else {"type": str(type(audio))},
+        }, hypothesis_id="B")
+        log_gc_stats("pipeline_ltx2.py:forward:before_return")
+        # #endregion
         if not return_dict:
             return DiffusionOutput(output=(video, audio))
 

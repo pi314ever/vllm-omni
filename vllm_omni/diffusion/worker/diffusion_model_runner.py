@@ -36,6 +36,10 @@ from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 
+# #region agent log
+from vllm_omni.diffusion.debug_mem_logger import log_event, log_gc_stats
+# #endregion
+
 logger = init_logger(__name__)
 
 
@@ -237,6 +241,13 @@ class DiffusionModelRunner:
         if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
+        # #region agent log
+        log_event("diffusion_model_runner.py:execute_model:entry", "execute_model called", data={
+            "num_prompts": len(req.prompts),
+            "sampling_params_keys": list(vars(req.sampling_params).keys()) if hasattr(req.sampling_params, '__dict__') else "N/A",
+        }, hypothesis_id="D")
+        # #endregion
+
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
@@ -276,6 +287,9 @@ class DiffusionModelRunner:
 
             if is_primary:
                 self._record_peak_memory(output)
+            # #region agent log
+            log_event("diffusion_model_runner.py:execute_model:after_forward", "pipeline.forward returned", hypothesis_id="D")
+            # #endregion
 
             # NOTE:
             if (
@@ -286,6 +300,12 @@ class DiffusionModelRunner:
             ):
                 cache_summary(self.pipeline, details=True)
 
+            # #region agent log
+            import gc as _gc_runner
+            _gc_runner.collect()
+            log_event("diffusion_model_runner.py:execute_model:after_gc", "after gc.collect()", hypothesis_id="D")
+            log_gc_stats("diffusion_model_runner.py:execute_model:after_gc")
+            # #endregion
             return output
 
     # ------------------------------------------------------------------
