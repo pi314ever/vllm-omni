@@ -957,6 +957,8 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         self._interrupt = False
         self._current_timestep = None
 
+        cfg_parallel_ready = self._is_cfg_parallel_enabled(self.do_classifier_free_guidance)
+
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -1155,6 +1157,26 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         }, hypothesis_id="E")
         # #endregion
 
+        # #region agent log
+        _wt_nan = 0
+        _wt_total = 0
+        _wt_samples = {}
+        for _wn, _wp in self.transformer.named_parameters():
+            _wt_total += 1
+            _wf = _wp.data.float()
+            if torch.isnan(_wf).any():
+                _wt_nan += 1
+                if len(_wt_samples) < 5:
+                    _wt_samples[_wn] = {"shape": list(_wp.shape), "device": str(_wp.device),
+                                        "nan_pct": round(float(torch.isnan(_wf).sum()) / max(_wf.numel(), 1) * 100, 2)}
+        log_event("pipeline_ltx2.py:forward:transformer_weight_check", "transformer weight sanity", data={
+            "total_params": _wt_total,
+            "params_with_nan": _wt_nan,
+            "nan_samples": _wt_samples,
+            "transformer_device": str(next(self.transformer.parameters()).device),
+        }, hypothesis_id="H6")
+        # #endregion
+
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -1227,16 +1249,16 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 )
 
                 pbar.update()
-            # #region agent log
-            if i == 0 or i == len(timesteps) - 1:
-                log_event(f"pipeline_ltx2.py:forward:step_{i}_latent_stats", f"latent stats after step {i}", data={
-                    "step": i,
-                    "total_steps": len(timesteps),
-                    "latents_stats": _tensor_stats(latents, f"latents_step_{i}"),
-                    "audio_latents_stats": _tensor_stats(audio_latents, f"audio_latents_step_{i}"),
-                    "cfg_parallel_ready": cfg_parallel_ready,
-                }, hypothesis_id="H1")
-            # #endregion
+                # #region agent log
+                if i == 0 or i == len(timesteps) - 1:
+                    log_event(f"pipeline_ltx2.py:forward:step_{i}_latent_stats", f"latent stats after step {i}", data={
+                        "step": i,
+                        "total_steps": len(timesteps),
+                        "latents_stats": _tensor_stats(latents, f"latents_step_{i}"),
+                        "audio_latents_stats": _tensor_stats(audio_latents, f"audio_latents_step_{i}"),
+                        "cfg_parallel_ready": cfg_parallel_ready,
+                    }, hypothesis_id="H1")
+                # #endregion
 
         # #region agent log
         log_event("pipeline_ltx2.py:forward:after_denoise_loop", "denoising loop finished", data={
