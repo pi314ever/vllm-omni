@@ -164,19 +164,8 @@ def apply_sequential_offload(
             use_hsdp=use_hsdp,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
-        logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
-
-    # Register hooks on encoders (offload DiTs when encoder runs)
-    for enc in encoder_modules:
-        registry = HookRegistry.get_or_create(enc)
-        hook = SequentialOffloadHook(
-            offload_targets=dit_modules,
-            device=device,
-            pin_memory=pin_memory,
-            use_hsdp=use_hsdp,
-        )
-        registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
-        logger.debug("Registered offload hook for %s", enc.__class__.__name__)
+        logger.debug("Registered offload hook for %s (targets: %d others)",
+                      module.__class__.__name__, len(offload_targets))
 
 
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
