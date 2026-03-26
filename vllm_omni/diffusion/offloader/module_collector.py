@@ -15,7 +15,11 @@ class PipelineModules:
     dit_names: list[str]
     encoders: list[nn.Module]
     encoder_names: list[str]
-    vae: nn.Module | None = None
+    auxiliaries: list[nn.Module]
+    auxiliary_names: list[str]
+    # All modules discovered from VAE_ATTRS (e.g. video + audio VAE), in order.
+    vaes: list[nn.Module]
+    vae_names: list[str]
 
 
 class ModuleDiscovery:
@@ -23,6 +27,7 @@ class ModuleDiscovery:
 
     DIT_ATTRS = ["transformer", "transformer_2", "dit", "sr_dit", "language_model", "transformer_blocks", "model"]
     ENCODER_ATTRS = ["text_encoder", "text_encoder_2", "text_encoder_3", "image_encoder"]
+    AUXILIARY_ATTRS = ["connectors", "vocoder"]
     VAE_ATTRS = ["vae", "audio_vae"]
 
     @staticmethod
@@ -63,18 +68,31 @@ class ModuleDiscovery:
                 encoders.append(getattr(pipeline, attr))
                 encoder_names.append(attr)
 
-        # Collect VAE
-        vae = None
+        # Collect auxiliary modules (connectors, vocoder, etc.)
+        auxiliaries: list[nn.Module] = []
+        auxiliary_names: list[str] = []
+        for attr in ModuleDiscovery.AUXILIARY_ATTRS:
+            module = getattr(pipeline, attr, None)
+            if module is not None and isinstance(module, nn.Module):
+                auxiliaries.append(module)
+                auxiliary_names.append(attr)
+
+        # Collect all VAE submodules (e.g. video VAE + audio VAE)
+        vaes: list[nn.Module] = []
+        vae_names: list[str] = []
         for attr in ModuleDiscovery.VAE_ATTRS:
             module = getattr(pipeline, attr, None)
-            if module is not None:
-                vae = module
-                break
+            if module is not None and isinstance(module, nn.Module):
+                vaes.append(module)
+                vae_names.append(attr)
 
         return PipelineModules(
             dits=dit_modules,
             dit_names=dit_names,
             encoders=encoders,
             encoder_names=encoder_names,
-            vae=vae,
+            auxiliaries=auxiliaries,
+            auxiliary_names=auxiliary_names,
+            vaes=vaes,
+            vae_names=vae_names,
         )

@@ -36,6 +36,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.platforms import current_omni_platform
 
 from .ltx2_transformer import LTX2VideoTransformer3DModel
 from .pipeline_ltx2_latent_upsample import LTX2LatentUpsamplePipeline
@@ -760,6 +761,39 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     def interrupt(self):
         return self._interrupt
 
+    @staticmethod
+    def _move_module_params(module: nn.Module, device: torch.device) -> None:
+        """Move module parameters and buffers to device without recursive .to()."""
+        for p in module.parameters():
+            if p.data.device != device:
+                p.data = p.data.to(device, non_blocking=True)
+        for b in module.buffers():
+            if b.device != device:
+                b.data = b.data.to(device, non_blocking=True)
+
+    def _swap_for_decode(self, target: nn.Module, offload: list[nn.Module]) -> None:
+        """Move target to GPU and offload others to CPU for decode() calls
+        that bypass forward() hooks."""
+        if not getattr(self.od_config, "enable_cpu_offload", False):
+            return
+        cpu = torch.device("cpu")
+        for mod in offload:
+            try:
+                if next(mod.parameters()).device != cpu:
+                    self._move_module_params(mod, cpu)
+            except StopIteration:
+                pass
+        current_omni_platform.empty_cache()
+        try:
+            if next(target.parameters()).device != self.device:
+                self._move_module_params(target, self.device)
+        except StopIteration:
+            pass
+        current_omni_platform.synchronize()
+
+    def _is_cfg_parallel_enabled(self, do_true_cfg: bool) -> bool:
+        return do_true_cfg and get_classifier_free_guidance_world_size() > 1
+
     def _transformer_cache_context(self, context_name: str):
         cache_context = getattr(self.transformer, "cache_context", None)
         if callable(cache_context):
@@ -1234,12 +1268,22 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 ]
                 latents = (1 - decode_noise_scale) * latents + decode_noise_scale * noise
 
+            self._swap_for_decode(self.vae,
+                                  [self.transformer, self.text_encoder,
+                                   self.connectors, self.audio_vae, self.vocoder])
             latents = latents.to(self.vae.dtype)
             video = self.vae.decode(latents, timestep, return_dict=False)[0]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
 
+            self._swap_for_decode(self.audio_vae,
+                                  [self.vae, self.transformer, self.text_encoder,
+                                   self.connectors, self.vocoder])
             audio_latents = audio_latents.to(self.audio_vae.dtype)
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
+
+            self._swap_for_decode(self.vocoder,
+                                  [self.audio_vae, self.vae, self.transformer,
+                                   self.text_encoder, self.connectors])
             audio = self.vocoder(generated_mel_spectrograms)
 
         # #region agent log
