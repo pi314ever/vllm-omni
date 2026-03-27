@@ -827,6 +827,16 @@ class LTX2VideoTransformerBlock(nn.Module):
         a2v_cross_attention_mask: torch.Tensor | None = None,
         v2a_cross_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # #region agent log
+        _trace = getattr(self, "_trace_nan", False)
+        def _qnc(name, t):
+            if not _trace:
+                return None
+            ft = t.float()
+            return {"name": name, "nan": bool(torch.isnan(ft).any()),
+                    "min": round(float(ft.min()), 4), "max": round(float(ft.max()), 4),
+                    "absmax": round(float(ft.abs().max()), 4)}
+        # #endregion
         batch_size = hidden_states.size(0)
 
         # 1. Video and Audio Self-Attention
@@ -846,6 +856,15 @@ class LTX2VideoTransformerBlock(nn.Module):
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa
 
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_video_self_attn", "video self-attn done", data={
+                "hidden_states": _qnc("hs", hidden_states),
+                "attn_output": _qnc("attn1_out", attn_hidden_states),
+                "gate_msa": _qnc("gate_msa", gate_msa),
+            }, hypothesis_id="H10")
+        # #endregion
+
         norm_audio_hidden_states = self.audio_norm1(audio_hidden_states)
 
         num_audio_ada_params = self.audio_scale_shift_table.shape[0]
@@ -864,6 +883,14 @@ class LTX2VideoTransformerBlock(nn.Module):
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * audio_gate_msa
 
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_audio_self_attn", "audio self-attn done", data={
+                "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
+                "attn_audio_output": _qnc("audio_attn1_out", attn_audio_hidden_states),
+            }, hypothesis_id="H10")
+        # #endregion
+
         # 2. Video and Audio Cross-Attention with the text embeddings
         norm_hidden_states = self.norm2(hidden_states)
         attn_hidden_states = self.attn2(
@@ -874,6 +901,14 @@ class LTX2VideoTransformerBlock(nn.Module):
         )
         hidden_states = hidden_states + attn_hidden_states
 
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_video_cross_attn", "video cross-attn with text done", data={
+                "hidden_states": _qnc("hs", hidden_states),
+                "attn2_out": _qnc("attn2_out", attn_hidden_states),
+            }, hypothesis_id="H10")
+        # #endregion
+
         norm_audio_hidden_states = self.audio_norm2(audio_hidden_states)
         attn_audio_hidden_states = self.audio_attn2(
             norm_audio_hidden_states,
@@ -882,6 +917,14 @@ class LTX2VideoTransformerBlock(nn.Module):
             attention_mask=audio_encoder_attention_mask,
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
+
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_audio_cross_attn", "audio cross-attn with text done", data={
+                "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
+                "audio_attn2_out": _qnc("audio_attn2_out", attn_audio_hidden_states),
+            }, hypothesis_id="H10")
+        # #endregion
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
         norm_hidden_states = self.audio_to_video_norm(hidden_states)
@@ -938,6 +981,15 @@ class LTX2VideoTransformerBlock(nn.Module):
 
         hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_a2v_cross_attn", "audio-to-video cross-attn done", data={
+                "hidden_states": _qnc("hs", hidden_states),
+                "a2v_attn_out": _qnc("a2v_out", a2v_attn_hidden_states),
+                "a2v_gate": _qnc("a2v_gate", a2v_gate),
+            }, hypothesis_id="H10")
+        # #endregion
+
         # Video-to-Audio Cross Attention: Q: Audio; K,V: Video
         mod_norm_hidden_states = norm_hidden_states * (1 + video_v2a_ca_scale.squeeze(2)) + video_v2a_ca_shift.squeeze(
             2
@@ -956,14 +1008,39 @@ class LTX2VideoTransformerBlock(nn.Module):
 
         audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
 
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_v2a_cross_attn", "video-to-audio cross-attn done", data={
+                "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
+                "v2a_attn_out": _qnc("v2a_out", v2a_attn_hidden_states),
+                "v2a_gate": _qnc("v2a_gate", v2a_gate),
+            }, hypothesis_id="H10")
+        # #endregion
+
         # 4. Feedforward
         norm_hidden_states = self.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + ff_output * gate_mlp
 
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_video_ff", "video FFN done", data={
+                "hidden_states": _qnc("hs", hidden_states),
+                "ff_output": _qnc("ff_out", ff_output),
+            }, hypothesis_id="H10")
+        # #endregion
+
         norm_audio_hidden_states = self.audio_norm3(audio_hidden_states) * (1 + audio_scale_mlp) + audio_shift_mlp
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
         audio_hidden_states = audio_hidden_states + audio_ff_output * audio_gate_mlp
+
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:after_audio_ff", "audio FFN done", data={
+                "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
+                "audio_ff_output": _qnc("audio_ff_out", audio_ff_output),
+            }, hypothesis_id="H10")
+        # #endregion
 
         return hidden_states, audio_hidden_states
 
@@ -1759,6 +1836,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # 5. Run transformer blocks
         _nan_found_at_block = -1
         for _block_idx, block in enumerate(self.transformer_blocks):
+            # #region agent log
+            if _do_nan_trace and _block_idx in (4, 5):
+                block._trace_nan = True
+            # #endregion
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -1800,6 +1881,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 )
 
             # #region agent log
+            if _do_nan_trace and _block_idx in (4, 5):
+                block._trace_nan = False
             if _do_nan_trace and _nan_found_at_block < 0:
                 _v_nan = bool(torch.isnan(hidden_states).any())
                 _a_nan = bool(torch.isnan(audio_hidden_states).any())
