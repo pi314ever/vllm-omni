@@ -1375,7 +1375,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         # src/diffusers/pipelines/ltx2/connectors.py
         if self.rope_type == "interleaved":
             cos_freqs = freqs.cos().repeat_interleave(2, dim=-1)
-            sin_freqs = freqs.sin().repeat_interleave(2, dim=-1)
+            # NOTE(Daniel): Hack for XPU accuracy
+            sin_freqs = (freqs - torch.pi / 2).cos().repeat_interleave(2, dim=-1)
 
             if self.dim % num_rope_elems != 0:
                 cos_padding = torch.ones_like(cos_freqs[:, :, : self.dim % num_rope_elems])
@@ -1388,7 +1389,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             current_freqs = freqs.shape[-1]
             pad_size = expected_freqs - current_freqs
             cos_freq = freqs.cos()
-            sin_freq = freqs.sin()
+            # NOTE(Daniel): Hack for XPU accuracy
+            sin_freq = (freqs - torch.pi / 2).cos()
 
             if pad_size != 0:
                 cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
