@@ -67,6 +67,18 @@ def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, tor
     x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
     out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+    # #region agent log
+    if float(out.float().abs().max()) > 1e6:
+        log_event("apply_interleaved_rotary_emb:EXPLOSION", "RoPE output exploded", data={
+            "x_shape": list(x.shape), "x_absmax": round(float(x.float().abs().max()), 4),
+            "cos_shape": list(cos.shape), "cos_absmax": round(float(cos.float().abs().max()), 6),
+            "cos_min": round(float(cos.float().min()), 6), "cos_max": round(float(cos.float().max()), 6),
+            "sin_shape": list(sin.shape), "sin_absmax": round(float(sin.float().abs().max()), 6),
+            "out_absmax": float(out.float().abs().max()),
+            "term1_absmax": float((x.float() * cos).abs().max()),
+            "term2_absmax": float((x_rotated.float() * sin).abs().max()),
+        }, hypothesis_id="H12")
+    # #endregion
     return out
 
 
@@ -110,6 +122,16 @@ def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Ten
         out = out.swapaxes(1, 2).reshape(b, t, -1)
 
     out = out.to(dtype=x_dtype)
+    # #region agent log
+    if float(out.float().abs().max()) > 1e6:
+        log_event("apply_split_rotary_emb:EXPLOSION", "RoPE output exploded", data={
+            "x_shape": list(x.shape), "x_absmax": round(float(x.float().abs().max()), 4),
+            "cos_shape": list(cos.shape), "cos_absmax": round(float(cos.float().abs().max()), 6),
+            "cos_min": round(float(cos.float().min()), 6), "cos_max": round(float(cos.float().max()), 6),
+            "sin_shape": list(sin.shape), "sin_absmax": round(float(sin.float().abs().max()), 6),
+            "out_absmax": float(out.float().abs().max()),
+        }, hypothesis_id="H12")
+    # #endregion
     return out
 
 
@@ -470,9 +492,30 @@ class LTX2AudioVideoAttnProcessor:
         # #endregion
 
         if query_rotary_emb is not None:
+            # #region agent log
+            if _attn_trace:
+                _pre_cos, _pre_sin = query_rotary_emb
+                log_event("ltx2_attn:rope_pre_slice", "RoPE before TP slice", data={
+                    "rope_type": attn.rope_type,
+                    "cos_shape": list(_pre_cos.shape), "cos_ndim": _pre_cos.ndim,
+                    "cos": _anc("cos_pre", _pre_cos), "sin": _anc("sin_pre", _pre_sin),
+                    "heads": attn.heads, "head_dim": attn.head_dim,
+                    "tp_size": get_tensor_model_parallel_world_size(),
+                    "tp_rank": get_tensor_model_parallel_rank(),
+                }, hypothesis_id="H12")
+            # #endregion
             query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
             if key_rotary_emb is not None:
                 key_rotary_emb = self._slice_rope_for_tp(key_rotary_emb, attn)
+            # #region agent log
+            if _attn_trace:
+                _post_cos, _post_sin = query_rotary_emb
+                log_event("ltx2_attn:rope_post_slice", "RoPE after TP slice", data={
+                    "cos_shape": list(_post_cos.shape), "sin_shape": list(_post_sin.shape),
+                    "cos": _anc("cos_post", _post_cos), "sin": _anc("sin_post", _post_sin),
+                    "q_shape": list(query.shape), "q": _anc("q_into_rope", query),
+                }, hypothesis_id="H12")
+            # #endregion
             if attn.rope_type == "interleaved":
                 query = apply_interleaved_rotary_emb(query, query_rotary_emb)
                 key = apply_interleaved_rotary_emb(
