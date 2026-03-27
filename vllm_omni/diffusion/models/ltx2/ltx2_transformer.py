@@ -446,8 +446,28 @@ class LTX2AudioVideoAttnProcessor:
             is_self_attention=is_self_attention,
         )
 
+        # #region agent log
+        _attn_trace = getattr(attn, "_trace_attn", False)
+        if _attn_trace:
+            def _anc(name, t):
+                ft = t.float()
+                return {"name": name, "nan": bool(torch.isnan(ft).any()),
+                        "min": round(float(ft.min()), 4), "max": round(float(ft.max()), 4),
+                        "absmax": round(float(ft.abs().max()), 4), "shape": list(t.shape)}
+            log_event("ltx2_attn:after_qkv_proj", "QKV projected", data={
+                "query": _anc("q", query), "key": _anc("k", key), "value": _anc("v", value),
+            }, hypothesis_id="H11")
+        # #endregion
+
         query = attn.norm_q(query)
         key = attn.norm_k(key)
+
+        # #region agent log
+        if _attn_trace:
+            log_event("ltx2_attn:after_qk_norm", "QK normalized", data={
+                "query": _anc("q_norm", query), "key": _anc("k_norm", key),
+            }, hypothesis_id="H11")
+        # #endregion
 
         if query_rotary_emb is not None:
             query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
@@ -466,14 +486,38 @@ class LTX2AudioVideoAttnProcessor:
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
+        # #region agent log
+        if _attn_trace:
+            log_event("ltx2_attn:after_rope", "RoPE applied", data={
+                "query": _anc("q_rope", query), "key": _anc("k_rope", key),
+            }, hypothesis_id="H11")
+        # #endregion
+
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         hidden_states = attn.attn(query, key, value, attn_metadata)
+
+        # #region agent log
+        if _attn_trace:
+            log_event("ltx2_attn:after_kernel", "attention kernel done", data={
+                "attn_out": _anc("attn_out", hidden_states),
+            }, hypothesis_id="H11")
+        # #endregion
+
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
         hidden_states = attn.to_out[0](hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
+
+        # #region agent log
+        if _attn_trace:
+            log_event("ltx2_attn:after_out_proj", "output projection done", data={
+                "out": _anc("out_proj", hidden_states),
+            }, hypothesis_id="H11")
+            attn._trace_attn = False
+        # #endregion
+
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
 
@@ -875,6 +919,17 @@ class LTX2VideoTransformerBlock(nn.Module):
             audio_ada_values.unbind(dim=2)
         )
         norm_audio_hidden_states = norm_audio_hidden_states * (1 + audio_scale_msa) + audio_shift_msa
+
+        # #region agent log
+        if _trace:
+            log_event("ltx2_block:before_audio_attn1", "input to audio_attn1", data={
+                "norm_audio_hs": _qnc("norm_audio_hs", norm_audio_hidden_states),
+                "audio_scale_msa": _qnc("audio_scale_msa", audio_scale_msa),
+                "audio_shift_msa": _qnc("audio_shift_msa", audio_shift_msa),
+                "audio_gate_msa": _qnc("audio_gate_msa", audio_gate_msa),
+            }, hypothesis_id="H11")
+            self.audio_attn1._trace_attn = True
+        # #endregion
 
         attn_audio_hidden_states = self.audio_attn1(
             hidden_states=norm_audio_hidden_states,
