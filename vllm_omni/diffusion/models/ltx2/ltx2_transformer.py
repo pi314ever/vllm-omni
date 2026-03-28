@@ -1376,9 +1376,9 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         if self.rope_type == "interleaved":
             # NOTE(Daniel): Hack for XPU accuracy
             orig_dtype = freqs.dtype
-            freqs_f32 = freqs.float()
-            cos_freqs = freqs_f32.cos().to(orig_dtype).repeat_interleave(2, dim=-1)
-            sin_freqs = freqs_f32.sin().to(orig_dtype).repeat_interleave(2, dim=-1)
+            freqs_hp = freqs.double()
+            cos_freqs = freqs_hp.cos().to(orig_dtype).repeat_interleave(2, dim=-1)
+            sin_freqs = freqs_hp.sin().to(orig_dtype).repeat_interleave(2, dim=-1)
 
             if self.dim % num_rope_elems != 0:
                 cos_padding = torch.ones_like(cos_freqs[:, :, : self.dim % num_rope_elems])
@@ -1392,9 +1392,9 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             pad_size = expected_freqs - current_freqs
             # NOTE(Daniel): Hack for XPU accuracy
             orig_dtype = freqs.dtype
-            freqs_f32 = freqs.float()
-            cos_freq = freqs_f32.cos().to(orig_dtype)
-            sin_freq = freqs_f32.sin().to(orig_dtype)
+            freqs_hp = freqs.double()
+            cos_freq = freqs_hp.cos().to(orig_dtype)
+            sin_freq = freqs_hp.sin().to(orig_dtype)
 
             if pad_size != 0:
                 cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
