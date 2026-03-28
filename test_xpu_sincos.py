@@ -1,109 +1,119 @@
-"""Isolated test: XPU sin/cos accuracy for large float32 inputs.
+"""Pytest: XPU sin/cos accuracy for RoPE-range inputs across dtypes.
 
-Demonstrates that torch.sin() and torch.cos() on XPU produce garbage
-values for large float32 inputs due to a broken range-reduction algorithm,
-while float64 (double) works correctly.
+Demonstrates that torch.sin()/torch.cos() on XPU produce incorrect values
+for large inputs in certain dtypes due to broken range-reduction, while
+higher-precision computation works correctly.
 
 Usage:
-    python test_xpu_sincos.py
+    pytest test_xpu_sincos.py -v
 """
 
-import torch
 import math
 
-def test_sincos_accuracy():
-    assert torch.xpu.is_available(), "XPU not available"
-    device = "xpu:0"
+import pytest
+import torch
 
-    # RoPE frequencies: theta^(linspace(0,1,1024)) * pi/2
-    # Range: ~1.57 to ~15708
+DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.float64]
+DTYPE_IDS = ["bf16", "fp16", "fp32", "fp64"]
+
+
+def _rope_freqs(device: str = "cpu", dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """Generate RoPE frequencies matching LTX2 config (theta=10000, dim=2048)."""
     theta = 10000.0
     steps = 1024
     pow_indices = torch.pow(
         theta,
         torch.linspace(0.0, 1.0, steps, dtype=torch.float64, device=device),
     )
-    freqs_f64 = pow_indices * math.pi / 2.0  # float64
-    freqs_f32 = freqs_f64.float()             # float32
-
-    # Ground truth: float64 sin/cos (correct on both CPU and XPU)
-    cos_ref = freqs_f64.cos()
-    sin_ref = freqs_f64.sin()
-
-    # Test: float32 sin/cos on XPU
-    cos_f32 = freqs_f32.cos()
-    sin_f32 = freqs_f32.sin()
-
-    # float64 sin/cos on XPU (proposed fix)
-    cos_fix = freqs_f32.double().cos().float()
-    sin_fix = freqs_f32.double().sin().float()
-
-    print("=" * 70)
-    print("XPU sin/cos accuracy test")
-    print("=" * 70)
-    print(f"  freqs range: [{float(freqs_f32.min()):.2f}, {float(freqs_f32.max()):.2f}]")
-    print(f"  freqs dtype: {freqs_f32.dtype}, device: {freqs_f32.device}")
-    print()
-
-    # Compare cos
-    cos_err = (cos_f32.double() - cos_ref).abs()
-    cos_fix_err = (cos_fix.double() - cos_ref).abs()
-    print("--- cos ---")
-    print(f"  f32 cos range:  [{float(cos_f32.min()):.6f}, {float(cos_f32.max()):.6f}]")
-    print(f"  f32 cos absmax: {float(cos_f32.abs().max()):.6f}  (expected <= 1.0)")
-    print(f"  f32 cos max_err vs f64 ref: {float(cos_err.max()):.6e}")
-    print(f"  f32 cos elements with |err| > 1: {int((cos_err > 1).sum())} / {steps}")
-    print()
-    print(f"  fix cos range:  [{float(cos_fix.min()):.6f}, {float(cos_fix.max()):.6f}]")
-    print(f"  fix cos absmax: {float(cos_fix.abs().max()):.6f}  (expected <= 1.0)")
-    print(f"  fix cos max_err vs f64 ref: {float(cos_fix_err.max()):.6e}")
-    print()
-
-    # Compare sin
-    sin_err = (sin_f32.double() - sin_ref).abs()
-    sin_fix_err = (sin_fix.double() - sin_ref).abs()
-    print("--- sin ---")
-    print(f"  f32 sin range:  [{float(sin_f32.min()):.6f}, {float(sin_f32.max()):.6f}]")
-    print(f"  f32 sin absmax: {float(sin_f32.abs().max()):.6e}  (expected <= 1.0)")
-    print(f"  f32 sin max_err vs f64 ref: {float(sin_err.max()):.6e}")
-    print(f"  f32 sin elements with |err| > 1: {int((sin_err > 1).sum())} / {steps}")
-    print()
-    print(f"  fix sin range:  [{float(sin_fix.min()):.6f}, {float(sin_fix.max()):.6f}]")
-    print(f"  fix sin absmax: {float(sin_fix.abs().max()):.6f}  (expected <= 1.0)")
-    print(f"  fix sin max_err vs f64 ref: {float(sin_fix_err.max()):.6e}")
-    print()
-
-    # Show worst offenders
-    print("--- worst sin values (f32 on XPU) ---")
-    worst_idx = sin_err.topk(min(5, steps)).indices
-    for i in worst_idx:
-        print(f"  freq={float(freqs_f32[i]):.2f}  "
-              f"sin_f32={float(sin_f32[i]):.6e}  "
-              f"sin_ref={float(sin_ref[i]):.6f}  "
-              f"err={float(sin_err[i]):.6e}")
-    print()
-
-    print("--- worst cos values (f32 on XPU) ---")
-    worst_idx = cos_err.topk(min(5, steps)).indices
-    for i in worst_idx:
-        print(f"  freq={float(freqs_f32[i]):.2f}  "
-              f"cos_f32={float(cos_f32[i]):.6e}  "
-              f"cos_ref={float(cos_ref[i]):.6f}  "
-              f"err={float(cos_err[i]):.6e}")
-    print()
-
-    # Summary
-    f32_broken = int((sin_err > 1).sum()) + int((cos_err > 1).sum())
-    fix_broken = int((sin_fix_err > 1).sum()) + int((cos_fix_err > 1).sum())
-    print("=" * 70)
-    print(f"RESULT: f32 sin/cos has {f32_broken} / {steps * 2} values with |err| > 1")
-    print(f"RESULT: f64 fix    has {fix_broken} / {steps * 2} values with |err| > 1")
-    if f32_broken > 0 and fix_broken == 0:
-        print("CONCLUSION: XPU float32 sin/cos is broken; float64 workaround fixes it")
-    elif f32_broken == 0:
-        print("CONCLUSION: XPU float32 sin/cos appears correct on this device")
-    print("=" * 70)
+    return (pow_indices * math.pi / 2.0).to(dtype=dtype)
 
 
-if __name__ == "__main__":
-    test_sincos_accuracy()
+@pytest.fixture(scope="module")
+def cpu_reference():
+    """Ground truth: float64 sin/cos computed on CPU."""
+    freqs = _rope_freqs(device="cpu", dtype=torch.float64)
+    return freqs.cos(), freqs.sin()
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+def test_cos_accuracy(dtype, cpu_reference):
+    """cos() on XPU in the given dtype should match CPU float64 reference."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU not available")
+
+    cos_ref, _ = cpu_reference
+    freqs_xpu = _rope_freqs(device="xpu:0", dtype=dtype)
+    cos_xpu = freqs_xpu.cos()
+
+    err = (cos_xpu.double().cpu() - cos_ref).abs()
+    n_broken = int((err > 1.0).sum())
+    max_err = float(err.max())
+
+    assert n_broken == 0, (
+        f"cos({dtype}): {n_broken}/1024 elements have |err|>1 vs CPU f64 reference "
+        f"(max_err={max_err:.6e}, absmax={float(cos_xpu.abs().max()):.6e})"
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+def test_sin_accuracy(dtype, cpu_reference):
+    """sin() on XPU in the given dtype should match CPU float64 reference."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU not available")
+
+    _, sin_ref = cpu_reference
+    freqs_xpu = _rope_freqs(device="xpu:0", dtype=dtype)
+    sin_xpu = freqs_xpu.sin()
+
+    err = (sin_xpu.double().cpu() - sin_ref).abs()
+    n_broken = int((err > 1.0).sum())
+    max_err = float(err.max())
+
+    assert n_broken == 0, (
+        f"sin({dtype}): {n_broken}/1024 elements have |err|>1 vs CPU f64 reference "
+        f"(max_err={max_err:.6e}, absmax={float(sin_xpu.abs().max()):.6e})"
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+def test_sincos_bounded(dtype):
+    """sin() and cos() outputs must be in [-1, 1] regardless of input magnitude."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU not available")
+
+    freqs = _rope_freqs(device="xpu:0", dtype=dtype)
+    cos_vals = freqs.cos()
+    sin_vals = freqs.sin()
+
+    cos_absmax = float(cos_vals.float().abs().max())
+    sin_absmax = float(sin_vals.float().abs().max())
+
+    assert cos_absmax <= 1.0 + 1e-3, (
+        f"cos({dtype}) absmax={cos_absmax:.6e}, expected <= 1.0"
+    )
+    assert sin_absmax <= 1.0 + 1e-3, (
+        f"sin({dtype}) absmax={sin_absmax:.6e}, expected <= 1.0"
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+def test_f64_workaround(dtype, cpu_reference):
+    """Workaround: upcast to f64, compute sin/cos, downcast — should match CPU reference."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU not available")
+
+    cos_ref, sin_ref = cpu_reference
+    freqs_xpu = _rope_freqs(device="xpu:0", dtype=dtype)
+
+    cos_fix = freqs_xpu.double().cos().to(dtype)
+    sin_fix = freqs_xpu.double().sin().to(dtype)
+
+    cos_err = (cos_fix.double().cpu() - cos_ref).abs()
+    sin_err = (sin_fix.double().cpu() - sin_ref).abs()
+
+    assert int((cos_err > 1.0).sum()) == 0, (
+        f"f64-workaround cos({dtype}): still broken, max_err={float(cos_err.max()):.6e}"
+    )
+    assert int((sin_err > 1.0).sum()) == 0, (
+        f"f64-workaround sin({dtype}): still broken, max_err={float(sin_err.max()):.6e}"
+    )
