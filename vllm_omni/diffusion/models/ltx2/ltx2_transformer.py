@@ -1377,8 +1377,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             # NOTE(Daniel): Hack for XPU accuracy
             orig_dtype = freqs.dtype
             freqs_hp = freqs.double()
-            cos_freqs = freqs_hp.cos().to(orig_dtype).repeat_interleave(2, dim=-1)
-            sin_freqs = freqs_hp.sin().to(orig_dtype).repeat_interleave(2, dim=-1)
+            cos_freqs = freqs_hp.cos().to(orig_dtype).repeat_interleave(2, dim=-1).contiguous()
+            sin_freqs = freqs_hp.sin().to(orig_dtype).repeat_interleave(2, dim=-1).contiguous()
 
             if self.dim % num_rope_elems != 0:
                 cos_padding = torch.ones_like(cos_freqs[:, :, : self.dim % num_rope_elems])
@@ -1419,8 +1419,17 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             cos_freq = cos_freq.reshape(b, t, self.num_attention_heads, -1)
             sin_freq = sin_freq.reshape(b, t, self.num_attention_heads, -1)
 
-            cos_freqs = torch.swapaxes(cos_freq, 1, 2)  # (B,H,T,D//2)
-            sin_freqs = torch.swapaxes(sin_freq, 1, 2)  # (B,H,T,D//2)
+            cos_freqs = torch.swapaxes(cos_freq, 1, 2).contiguous()  # (B,H,T,D//2)
+            sin_freqs = torch.swapaxes(sin_freq, 1, 2).contiguous()  # (B,H,T,D//2)
+            # #region agent log
+            log_event("rope_forward:split_final", "after reshape+swapaxes+contiguous", data={
+                "cos_absmax": round(float(cos_freqs.float().abs().max()), 6),
+                "sin_absmax": round(float(sin_freqs.float().abs().max()), 6),
+                "cos_contiguous": cos_freqs.is_contiguous(),
+                "sin_contiguous": sin_freqs.is_contiguous(),
+                "FIX_VERSION": "contiguous_v1",
+            }, hypothesis_id="H14")
+            # #endregion
 
         return cos_freqs, sin_freqs
 
