@@ -1395,6 +1395,15 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             freqs_hp = freqs.double()
             cos_freq = freqs_hp.cos().to(orig_dtype)
             sin_freq = freqs_hp.sin().to(orig_dtype)
+            # #region agent log
+            log_event("rope_forward:split_trig", "sin/cos computed", data={
+                "freqs_dtype": str(freqs.dtype), "hp_dtype": str(freqs_hp.dtype),
+                "orig_dtype": str(orig_dtype),
+                "cos_absmax": round(float(cos_freq.float().abs().max()), 6),
+                "sin_absmax": round(float(sin_freq.float().abs().max()), 6),
+                "FIX_VERSION": "double_v2",
+            }, hypothesis_id="H13")
+            # #endregion
 
             if pad_size != 0:
                 cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
