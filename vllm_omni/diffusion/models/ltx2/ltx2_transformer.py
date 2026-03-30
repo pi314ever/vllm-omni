@@ -67,18 +67,6 @@ def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, tor
     x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
     out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-    # #region agent log
-    if float(out.float().abs().max()) > 1e6:
-        log_event("apply_interleaved_rotary_emb:EXPLOSION", "RoPE output exploded", data={
-            "x_shape": list(x.shape), "x_absmax": round(float(x.float().abs().max()), 4),
-            "cos_shape": list(cos.shape), "cos_absmax": round(float(cos.float().abs().max()), 6),
-            "cos_min": round(float(cos.float().min()), 6), "cos_max": round(float(cos.float().max()), 6),
-            "sin_shape": list(sin.shape), "sin_absmax": round(float(sin.float().abs().max()), 6),
-            "out_absmax": float(out.float().abs().max()),
-            "term1_absmax": float((x.float() * cos).abs().max()),
-            "term2_absmax": float((x_rotated.float() * sin).abs().max()),
-        }, hypothesis_id="H12")
-    # #endregion
     return out
 
 
@@ -122,16 +110,6 @@ def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Ten
         out = out.swapaxes(1, 2).reshape(b, t, -1)
 
     out = out.to(dtype=x_dtype)
-    # #region agent log
-    if float(out.float().abs().max()) > 1e6:
-        log_event("apply_split_rotary_emb:EXPLOSION", "RoPE output exploded", data={
-            "x_shape": list(x.shape), "x_absmax": round(float(x.float().abs().max()), 4),
-            "cos_shape": list(cos.shape), "cos_absmax": round(float(cos.float().abs().max()), 6),
-            "cos_min": round(float(cos.float().min()), 6), "cos_max": round(float(cos.float().max()), 6),
-            "sin_shape": list(sin.shape), "sin_absmax": round(float(sin.float().abs().max()), 6),
-            "out_absmax": float(out.float().abs().max()),
-        }, hypothesis_id="H12")
-    # #endregion
     return out
 
 
