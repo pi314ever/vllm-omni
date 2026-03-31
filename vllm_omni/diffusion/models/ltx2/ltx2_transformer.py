@@ -280,6 +280,26 @@ class TensorParallelRMSNorm(nn.Module):
         out = x_float * inv_rms
         if self.weight is not None:
             out = out * self.weight.float()
+        # #region agent log
+        if getattr(self, "_trace_norm", False) and bool(torch.isnan(out).any()):
+            _w = self.weight
+            log_event("tp_rmsnorm:NaN_detected", "RMSNorm produced NaN", data={
+                "x_nan": bool(torch.isnan(x_float).any()),
+                "x_absmax": round(float(x_float.abs().max()), 4),
+                "local_sum_nan": bool(torch.isnan(local_sum).any()),
+                "local_sum_val": round(float(local_sum.float().abs().max()), 4),
+                "inv_rms_nan": bool(torch.isnan(inv_rms).any()),
+                "inv_rms_val": round(float(inv_rms.float().abs().max()), 6) if not bool(torch.isnan(inv_rms).any()) else "NaN",
+                "weight_nan": bool(torch.isnan(_w).any()) if _w is not None else False,
+                "weight_absmax": round(float(_w.float().abs().max()), 6) if _w is not None else None,
+                "weight_shape": list(_w.shape) if _w is not None else None,
+                "out_nan": True,
+                "hidden_size": self.hidden_size,
+                "global_hidden_size": self.global_hidden_size,
+                "tp_size": self.tp_size,
+            }, hypothesis_id="H16")
+            self._trace_norm = False
+        # #endregion
         return out.to(dtype=x_dtype)
 
 
@@ -954,6 +974,8 @@ class LTX2VideoTransformerBlock(nn.Module):
                 "audio_gate_msa": _qnc("audio_gate_msa", audio_gate_msa),
             }, hypothesis_id="H11")
             self.audio_attn1._trace_attn = True
+            self.audio_attn1.norm_q._trace_norm = True
+            self.audio_attn1.norm_k._trace_norm = True
         # #endregion
 
         attn_audio_hidden_states = self.audio_attn1(
