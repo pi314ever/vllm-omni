@@ -1828,6 +1828,16 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_coords[:, 0:1, :], device=audio_hidden_states.device
         )
 
+        # NOTE(Daniel): XPU caching allocator corrupts sin tensors during CPU offload
+        # memory churn.  Stash on CPU and re-copy to GPU before each block.
+        _rope_device = hidden_states.device
+        _rope_cpu = (
+            (video_rotary_emb[0].cpu(), video_rotary_emb[1].cpu()),
+            (audio_rotary_emb[0].cpu(), audio_rotary_emb[1].cpu()),
+            (video_cross_attn_rotary_emb[0].cpu(), video_cross_attn_rotary_emb[1].cpu()),
+            (audio_cross_attn_rotary_emb[0].cpu(), audio_cross_attn_rotary_emb[1].cpu()),
+        )
+
         # #region agent log
         _do_nan_trace = not getattr(self, "_nan_traced", False)
         if _do_nan_trace:
@@ -1936,9 +1946,22 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # 5. Run transformer blocks
         _nan_found_at_block = -1
         for _block_idx, block in enumerate(self.transformer_blocks):
+            # Refresh RoPE tensors from CPU backup to avoid XPU allocator corruption
+            video_rotary_emb = (_rope_cpu[0][0].to(_rope_device), _rope_cpu[0][1].to(_rope_device))
+            audio_rotary_emb = (_rope_cpu[1][0].to(_rope_device), _rope_cpu[1][1].to(_rope_device))
+            video_cross_attn_rotary_emb = (_rope_cpu[2][0].to(_rope_device), _rope_cpu[2][1].to(_rope_device))
+            audio_cross_attn_rotary_emb = (_rope_cpu[3][0].to(_rope_device), _rope_cpu[3][1].to(_rope_device))
             # #region agent log
             if _do_nan_trace and _block_idx in (4, 5):
                 block._trace_nan = True
+                _sin_check = float(audio_rotary_emb[1].float().abs().max())
+                log_event("ltx2_transformer:forward:rope_refresh", f"RoPE refreshed for block {_block_idx}", data={
+                    "block_idx": _block_idx,
+                    "audio_sin_absmax": round(_sin_check, 6),
+                    "audio_cos_absmax": round(float(audio_rotary_emb[0].float().abs().max()), 6),
+                    "video_sin_absmax": round(float(video_rotary_emb[1].float().abs().max()), 6),
+                    "FIX_VERSION": "cpu_backup_v1",
+                }, hypothesis_id="H15")
             # #endregion
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
