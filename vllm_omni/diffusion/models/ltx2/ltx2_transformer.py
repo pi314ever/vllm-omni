@@ -914,6 +914,10 @@ class LTX2VideoTransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
 
+        # #region agent log
+        if _trace:
+            self.attn1._trace_attn = True
+        # #endregion
         attn_hidden_states = self.attn1(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=None,
@@ -1952,7 +1956,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
             video_cross_attn_rotary_emb = (_rope_cpu[2][0].to(_rope_device), _rope_cpu[2][1].to(_rope_device))
             audio_cross_attn_rotary_emb = (_rope_cpu[3][0].to(_rope_device), _rope_cpu[3][1].to(_rope_device))
             # #region agent log
-            if _do_nan_trace and _block_idx in (4, 5):
+            if _do_nan_trace and _block_idx in (1, 2):
                 block._trace_nan = True
                 _sin_check = float(audio_rotary_emb[1].float().abs().max())
                 log_event("ltx2_transformer:forward:rope_refresh", f"RoPE refreshed for block {_block_idx}", data={
@@ -2004,7 +2008,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 )
 
             # #region agent log
-            if _do_nan_trace and _block_idx in (4, 5):
+            if _do_nan_trace and _block_idx in (1, 2):
                 block._trace_nan = False
             if _do_nan_trace and _nan_found_at_block < 0:
                 _v_nan = bool(torch.isnan(hidden_states).any())
