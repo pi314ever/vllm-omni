@@ -2119,21 +2119,11 @@ class LTX2VideoTransformer3DModel(nn.Module):
             video_cross_attn_rotary_emb = (_rope_cpu[2][0].to(_rope_device), _rope_cpu[2][1].to(_rope_device))
             audio_cross_attn_rotary_emb = (_rope_cpu[3][0].to(_rope_device), _rope_cpu[3][1].to(_rope_device))
             # #region agent log
-            if _do_nan_trace and _block_idx in (1, 2):
+            # Dynamic block trace: enable for the 2 blocks before the previous NaN block
+            _prev_nan_block = getattr(self, "_prev_nan_block", 39)
+            _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
+            if _do_nan_trace and _block_idx in _trace_blocks:
                 block._trace_nan = True
-                _sin_check = float(audio_rotary_emb[1].float().abs().max())
-                log_event(
-                    "ltx2_transformer:forward:rope_refresh",
-                    f"RoPE refreshed for block {_block_idx}",
-                    data={
-                        "block_idx": _block_idx,
-                        "audio_sin_absmax": round(_sin_check, 6),
-                        "audio_cos_absmax": round(float(audio_rotary_emb[0].float().abs().max()), 6),
-                        "video_sin_absmax": round(float(video_rotary_emb[1].float().abs().max()), 6),
-                        "FIX_VERSION": "cpu_backup_v1",
-                    },
-                    hypothesis_id="H15",
-                )
             # #endregion
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
@@ -2176,13 +2166,29 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 )
 
             # #region agent log
-            if _do_nan_trace and _block_idx in (1, 2):
+            if _do_nan_trace and _block_idx in _trace_blocks:
                 block._trace_nan = False
             if _do_nan_trace and _nan_found_at_block < 0:
                 _v_nan = bool(torch.isnan(hidden_states).any())
                 _a_nan = bool(torch.isnan(audio_hidden_states).any())
+                _v_absmax = float(hidden_states.float().abs().max())
+                _a_absmax = float(audio_hidden_states.float().abs().max())
+                if _block_idx % 5 == 0 or _v_absmax > 1e6 or _a_absmax > 1e6 or _v_nan or _a_nan:
+                    log_event(
+                        "ltx2_transformer:forward:block_stats",
+                        f"block {_block_idx} stats",
+                        data={
+                            "block_idx": _block_idx,
+                            "video_absmax": round(_v_absmax, 2),
+                            "audio_absmax": round(_a_absmax, 2),
+                            "video_nan": _v_nan,
+                            "audio_nan": _a_nan,
+                        },
+                        hypothesis_id="H17",
+                    )
                 if _v_nan or _a_nan:
                     _nan_found_at_block = _block_idx
+                    self._prev_nan_block = _block_idx
                     log_event(
                         "ltx2_transformer:forward:nan_in_block",
                         f"NaN first appeared in block {_block_idx}",
