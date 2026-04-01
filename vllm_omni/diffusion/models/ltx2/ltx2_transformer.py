@@ -1197,6 +1197,23 @@ class LTX2VideoTransformerBlock(nn.Module):
             1 + audio_v2a_ca_scale.squeeze(2)
         ) + audio_v2a_ca_shift.squeeze(2)
 
+        # #region agent log
+        if _trace:
+            self.video_to_audio_attn._trace_attn = True
+            self.video_to_audio_attn.norm_q._trace_norm = True
+            self.video_to_audio_attn.norm_k._trace_norm = True
+            log_event(
+                "ltx2_block:before_v2a_cross_attn",
+                "v2a inputs",
+                data={
+                    "mod_norm_video_hs": _qnc("mod_norm_video", mod_norm_hidden_states),
+                    "mod_norm_audio_hs": _qnc("mod_norm_audio", mod_norm_audio_hidden_states),
+                    "v2a_ca_video_scale": _qnc("v2a_ca_v_scale", video_v2a_ca_scale),
+                    "v2a_ca_audio_scale": _qnc("v2a_ca_a_scale", audio_v2a_ca_scale),
+                },
+                hypothesis_id="H17",
+            )
+        # #endregion
         v2a_attn_hidden_states = self.video_to_audio_attn(
             mod_norm_audio_hidden_states,
             encoder_hidden_states=mod_norm_hidden_states,
