@@ -4,9 +4,7 @@
 import gc
 import json
 import os
-import sys
 import time
-import traceback
 
 import torch
 
@@ -56,9 +54,15 @@ def _tensor_summary(t):
 def _tensor_stats(t, name="tensor"):
     """Summarize tensor shape AND value statistics for correctness debugging."""
     if not isinstance(t, torch.Tensor):
-        if hasattr(t, 'shape'):
-            return {"name": name, "type": str(type(t)), "shape": list(t.shape),
-                    "min": float(t.min()), "max": float(t.max()), "mean": float(t.mean())}
+        if hasattr(t, "shape"):
+            return {
+                "name": name,
+                "type": str(type(t)),
+                "shape": list(t.shape),
+                "min": float(t.min()),
+                "max": float(t.max()),
+                "mean": float(t.mean()),
+            }
         return {"name": name, "type": str(type(t))}
     ft = t.float()
     return {
@@ -92,7 +96,7 @@ def log_event(location, message, data=None, hypothesis_id=None, run_id=None):
     global _REQUEST_COUNTER, _STEP_COUNTER
     entry = {
         "sessionId": _SESSION_ID,
-        "id": f"log_{int(time.time()*1000)}_{os.getpid()}",
+        "id": f"log_{int(time.time() * 1000)}_{os.getpid()}",
         "timestamp": int(time.time() * 1000),
         "location": location,
         "message": message,

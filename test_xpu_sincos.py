@@ -18,13 +18,13 @@ DTYPE_IDS = ["bf16", "fp16", "fp32", "fp64"]
 
 # Shapes that match LTX2 RoPE computation at different stages
 SHAPES = [
-    "flat_1024",           # [1024] — simple 1D
-    "audio_pre_flatten",   # [1, 1, 1, 1024] — before transpose/flatten
+    "flat_1024",  # [1024] — simple 1D
+    "audio_pre_flatten",  # [1, 1, 1, 1024] — before transpose/flatten
     "audio_post_flatten",  # [1, 1, 1024] — after flatten
-    "audio_reshaped",      # [1, 1, 32, 32] — after reshape to heads
-    "audio_swapped",       # [1, 32, 1, 32] — after swapaxes (non-contiguous!)
-    "video_3d_grid",       # [1, 1024, 3, 342] — video before transpose
-    "video_transposed",    # [1, 1024, 342, 3] — video after transpose (non-contiguous)
+    "audio_reshaped",  # [1, 1, 32, 32] — after reshape to heads
+    "audio_swapped",  # [1, 32, 1, 32] — after swapaxes (non-contiguous!)
+    "video_3d_grid",  # [1, 1024, 3, 342] — video before transpose
+    "video_transposed",  # [1, 1024, 342, 3] — video after transpose (non-contiguous)
 ]
 
 
@@ -184,12 +184,8 @@ def test_contiguous_workaround(shape, dtype, xpu_device):
     cos_err = (cos_fix.double().cpu() - cos_ref).abs()
     sin_err = (sin_fix.double().cpu() - sin_ref).abs()
 
-    assert int((cos_err > 1.0).sum()) == 0, (
-        f"contiguous cos({dtype}, {shape}): max_err={float(cos_err.max()):.6e}"
-    )
-    assert int((sin_err > 1.0).sum()) == 0, (
-        f"contiguous sin({dtype}, {shape}): max_err={float(sin_err.max()):.6e}"
-    )
+    assert int((cos_err > 1.0).sum()) == 0, f"contiguous cos({dtype}, {shape}): max_err={float(cos_err.max()):.6e}"
+    assert int((sin_err > 1.0).sum()) == 0, f"contiguous sin({dtype}, {shape}): max_err={float(sin_err.max()):.6e}"
 
 
 # ---------------------------------------------------------------------------
@@ -211,9 +207,5 @@ def test_f64_workaround(shape, dtype, xpu_device):
     cos_err = (cos_fix.double().cpu() - cos_ref).abs()
     sin_err = (sin_fix.double().cpu() - sin_ref).abs()
 
-    assert int((cos_err > 1.0).sum()) == 0, (
-        f"f64 cos({dtype}, {shape}): max_err={float(cos_err.max()):.6e}"
-    )
-    assert int((sin_err > 1.0).sum()) == 0, (
-        f"f64 sin({dtype}, {shape}): max_err={float(sin_err.max()):.6e}"
-    )
+    assert int((cos_err > 1.0).sum()) == 0, f"f64 cos({dtype}, {shape}): max_err={float(cos_err.max()):.6e}"
+    assert int((sin_err > 1.0).sum()) == 0, f"f64 sin({dtype}, {shape}): max_err={float(sin_err.max()):.6e}"
