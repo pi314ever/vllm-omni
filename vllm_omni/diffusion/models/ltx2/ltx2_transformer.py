@@ -603,6 +603,47 @@ class LTX2AudioVideoAttnProcessor:
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
+        # #region agent log
+        if _attn_trace:
+            _w = attn.to_out[0].weight
+            _w_nan = bool(torch.isnan(_w).any())
+            _w_inf = bool(torch.isinf(_w).any())
+            _w_absmax = float(_w.float().abs().max()) if not _w_nan else "NaN"
+            _hs_nan = bool(torch.isnan(hidden_states).any())
+            _hs_absmax = float(hidden_states.float().abs().max()) if not _hs_nan else "NaN"
+            _manual_result = hidden_states.float() @ _w.float().T
+            _manual_nan = bool(torch.isnan(_manual_result).any())
+            _manual_inf = bool(torch.isinf(_manual_result).any())
+            _manual_absmax = float(_manual_result.abs().max()) if not _manual_nan else "NaN"
+            _bf16_result = hidden_states @ _w.T
+            _bf16_nan = bool(torch.isnan(_bf16_result).any())
+            _bf16_inf = bool(torch.isinf(_bf16_result).any())
+            _bf16_absmax = float(_bf16_result.float().abs().max()) if not _bf16_nan else "NaN"
+            log_event(
+                "ltx2_attn:before_out_proj",
+                "pre out_proj check",
+                data={
+                    "hs_shape": list(hidden_states.shape),
+                    "hs_dtype": str(hidden_states.dtype),
+                    "hs_nan": _hs_nan,
+                    "hs_absmax": _hs_absmax,
+                    "hs_contiguous": hidden_states.is_contiguous(),
+                    "weight_shape": list(_w.shape),
+                    "weight_nan": _w_nan,
+                    "weight_inf": _w_inf,
+                    "weight_absmax": _w_absmax,
+                    "manual_f32_nan": _manual_nan,
+                    "manual_f32_inf": _manual_inf,
+                    "manual_f32_absmax": _manual_absmax,
+                    "bf16_matmul_nan": _bf16_nan,
+                    "bf16_matmul_inf": _bf16_inf,
+                    "bf16_matmul_absmax": _bf16_absmax,
+                },
+                hypothesis_id="H18",
+            )
+            del _manual_result, _bf16_result
+        # #endregion
+
         hidden_states = attn.to_out[0](hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -1004,6 +1045,19 @@ class LTX2VideoTransformerBlock(nn.Module):
         # #region agent log
         if _trace:
             self.attn1._trace_attn = True
+            log_event(
+                "ltx2_block:before_video_self_attn",
+                "video self-attn inputs",
+                data={
+                    "hidden_states_in": _qnc("hs_in", hidden_states),
+                    "norm_hidden_states": _qnc("norm_hs", norm_hidden_states),
+                    "scale_msa": _qnc("scale_msa", scale_msa),
+                    "shift_msa": _qnc("shift_msa", shift_msa),
+                    "gate_msa": _qnc("gate_msa", gate_msa),
+                    "norm_hs_shape": list(norm_hidden_states.shape),
+                },
+                hypothesis_id="H19",
+            )
         # #endregion
         attn_hidden_states = self.attn1(
             hidden_states=norm_hidden_states,
