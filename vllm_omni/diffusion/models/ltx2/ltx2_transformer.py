@@ -2059,26 +2059,93 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
 
         # #region agent log
-        _do_nan_trace = not getattr(self, "_nan_traced", False)
-        if _do_nan_trace:
+        _fwd_call_idx = getattr(self, "_fwd_call_count", 0)
+        self._fwd_call_count = _fwd_call_idx + 1
+        _do_nan_trace = True  # trace every forward call
 
-            def _nc(name, t):
-                return {
-                    "name": name,
-                    "has_nan": bool(torch.isnan(t.float()).any()),
-                    "min": round(float(t.float().min()), 4),
-                    "max": round(float(t.float().max()), 4),
-                }
-
-            _rope_check = {
-                "video_rotary_cos": _nc("v_rope_cos", video_rotary_emb[0]),
-                "video_rotary_sin": _nc("v_rope_sin", video_rotary_emb[1]),
-                "audio_rotary_cos": _nc("a_rope_cos", audio_rotary_emb[0]),
-                "audio_rotary_sin": _nc("a_rope_sin", audio_rotary_emb[1]),
+        def _nc(name, t):
+            return {
+                "name": name,
+                "has_nan": bool(torch.isnan(t.float()).any()),
+                "has_inf": bool(torch.isinf(t.float()).any()),
+                "min": round(float(t.float().min()), 4),
+                "max": round(float(t.float().max()), 4),
             }
-            log_event(
-                "ltx2_transformer:forward:after_rope", "RoPE embeddings computed", data=_rope_check, hypothesis_id="H9"
-            )
+
+        _rope_check = {
+            "video_rotary_cos": _nc("v_rope_cos", video_rotary_emb[0]),
+            "video_rotary_sin": _nc("v_rope_sin", video_rotary_emb[1]),
+            "audio_rotary_cos": _nc("a_rope_cos", audio_rotary_emb[0]),
+            "audio_rotary_sin": _nc("a_rope_sin", audio_rotary_emb[1]),
+        }
+        log_event(
+            "ltx2_transformer:forward:after_rope",
+            f"RoPE embeddings computed (call {_fwd_call_idx})",
+            data={**_rope_check, "fwd_call_idx": _fwd_call_idx},
+            hypothesis_id="H9",
+        )
+
+        # H22a: Scan ALL non-block module parameters for corruption
+        _nonblock_modules = {
+            "proj_in": self.proj_in,
+            "audio_proj_in": self.audio_proj_in,
+            "time_embed": self.time_embed,
+            "audio_time_embed": self.audio_time_embed,
+            "av_cross_attn_video_scale_shift": self.av_cross_attn_video_scale_shift,
+            "av_cross_attn_video_a2v_gate": self.av_cross_attn_video_a2v_gate,
+            "av_cross_attn_audio_scale_shift": self.av_cross_attn_audio_scale_shift,
+            "av_cross_attn_audio_v2a_gate": self.av_cross_attn_audio_v2a_gate,
+            "caption_projection": self.caption_projection,
+            "audio_caption_projection": self.audio_caption_projection,
+            "norm_out": self.norm_out,
+            "proj_out": self.proj_out,
+            "audio_norm_out": self.audio_norm_out,
+            "audio_proj_out": self.audio_proj_out,
+        }
+        _bad_nonblock: list[dict] = []
+        for _mod_name, _mod in _nonblock_modules.items():
+            for _pname, _pval in _mod.named_parameters():
+                _has_nan = bool(torch.isnan(_pval).any())
+                _has_inf = bool(torch.isinf(_pval).any())
+                if _has_nan or _has_inf:
+                    _bad_nonblock.append(
+                        {
+                            "module": _mod_name,
+                            "param": _pname,
+                            "nan": _has_nan,
+                            "inf": _has_inf,
+                            "inf_count": int(torch.isinf(_pval).sum()),
+                            "numel": _pval.numel(),
+                        }
+                    )
+        # Also check scale_shift_table (nn.Parameter, not a module)
+        for _tbl_name in ("scale_shift_table", "audio_scale_shift_table"):
+            _tbl = getattr(self, _tbl_name, None)
+            if _tbl is not None:
+                _has_nan = bool(torch.isnan(_tbl).any())
+                _has_inf = bool(torch.isinf(_tbl).any())
+                if _has_nan or _has_inf:
+                    _bad_nonblock.append(
+                        {
+                            "module": _tbl_name,
+                            "param": "data",
+                            "nan": _has_nan,
+                            "inf": _has_inf,
+                            "inf_count": int(torch.isinf(_tbl).sum()),
+                            "numel": _tbl.numel(),
+                        }
+                    )
+        log_event(
+            "ltx2_transformer:forward:nonblock_param_scan",
+            f"Non-block param scan (call {_fwd_call_idx}): {len(_bad_nonblock)} bad",
+            data={
+                "fwd_call_idx": _fwd_call_idx,
+                "bad_nonblock": _bad_nonblock,
+                "num_bad": len(_bad_nonblock),
+                "backup_exists": hasattr(self, "_param_cpu_backup"),
+            },
+            hypothesis_id="H22a",
+        )
         # #endregion
 
         # 2. Patchify input projections
@@ -2105,8 +2172,9 @@ class LTX2VideoTransformer3DModel(nn.Module):
         if _do_nan_trace:
             log_event(
                 "ltx2_transformer:forward:after_proj_temb",
-                "proj_in + time_embed done",
+                f"proj_in + time_embed done (call {_fwd_call_idx})",
                 data={
+                    "fwd_call_idx": _fwd_call_idx,
                     "hidden_states": _nc("hidden_states", hidden_states),
                     "audio_hidden_states": _nc("audio_hs", audio_hidden_states),
                     "temb": _nc("temb", temb),
@@ -2189,13 +2257,16 @@ class LTX2VideoTransformer3DModel(nn.Module):
                         )
             log_event(
                 "ltx2_transformer:forward:weight_scan",
-                f"Scanned all {len(self.transformer_blocks)} blocks (full param scan)",
+                f"Scanned all {len(self.transformer_blocks)} blocks (call {_fwd_call_idx})",
                 data={
+                    "fwd_call_idx": _fwd_call_idx,
                     "total_blocks": len(self.transformer_blocks),
                     "bad_params": _bad_params,
                     "num_bad": len(_bad_params),
+                    "backup_present": hasattr(self, "_param_cpu_backup"),
+                    "backup_keys_count": len(getattr(self, "_param_cpu_backup", {})),
                 },
-                hypothesis_id="H20",
+                hypothesis_id="H22c",
             )
             log_event(
                 "ltx2_transformer:forward:before_blocks",
@@ -2230,12 +2301,11 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 _pval.data = _param_cpu_backup[_key].to(_pval.device)
                 _n_restored += 1
             # #region agent log
-            # Dynamic block trace: enable for the 2 blocks before the previous NaN block
             _prev_nan_block = getattr(self, "_prev_nan_block", 39)
             _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
-            if _do_nan_trace and _block_idx in _trace_blocks:
+            if _do_nan_trace and _fwd_call_idx == 0 and _block_idx in _trace_blocks:
                 block._trace_nan = True
-            if _do_nan_trace and _block_idx == _prev_nan_block:
+            if _do_nan_trace and _fwd_call_idx == 0 and _block_idx == _prev_nan_block:
                 _v2a_w = block.video_to_audio_attn.to_out[0].weight
                 _v2a_w_inf = bool(torch.isinf(_v2a_w).any())
                 _v2a_w_nan = bool(torch.isnan(_v2a_w).any())
@@ -2295,7 +2365,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 )
 
             # #region agent log
-            if _do_nan_trace and _block_idx in _trace_blocks:
+            if _do_nan_trace and _fwd_call_idx == 0 and _block_idx in _trace_blocks:
                 block._trace_nan = False
             if _do_nan_trace and _nan_found_at_block < 0:
                 _v_nan = bool(torch.isnan(hidden_states).any())
@@ -2305,8 +2375,9 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 if _block_idx % 5 == 0 or _v_absmax > 1e6 or _a_absmax > 1e6 or _v_nan or _a_nan:
                     log_event(
                         "ltx2_transformer:forward:block_stats",
-                        f"block {_block_idx} stats",
+                        f"block {_block_idx} stats (call {_fwd_call_idx})",
                         data={
+                            "fwd_call_idx": _fwd_call_idx,
                             "block_idx": _block_idx,
                             "video_absmax": round(_v_absmax, 2),
                             "audio_absmax": round(_a_absmax, 2),
@@ -2335,11 +2406,11 @@ class LTX2VideoTransformer3DModel(nn.Module):
 
         # #region agent log
         if _do_nan_trace:
-            self._nan_traced = True
             log_event(
                 "ltx2_transformer:forward:after_all_blocks",
-                "all blocks done",
+                f"all blocks done (call {_fwd_call_idx})",
                 data={
+                    "fwd_call_idx": _fwd_call_idx,
                     "nan_found_at_block": _nan_found_at_block,
                     "total_blocks": len(self.transformer_blocks),
                     "hidden_states": _nc("final_hs", hidden_states),
