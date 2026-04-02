@@ -2162,36 +2162,35 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
         audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
+        # Save CPU backup of all block parameters to protect against XPU allocator corruption
+        _param_cpu_backup: dict[str, torch.Tensor] = {}
+        for _si, _sb in enumerate(self.transformer_blocks):
+            for _pname, _pval in _sb.named_parameters():
+                _param_cpu_backup[f"{_si}.{_pname}"] = _pval.data.cpu()
+
         # #region agent log
         if _do_nan_trace:
-            _bad_v2a = []
-            _bad_sst = []
+            _bad_params: list[dict] = []
             for _si, _sb in enumerate(self.transformer_blocks):
-                _sw = _sb.video_to_audio_attn.to_out[0].weight
-                if bool(torch.isinf(_sw).any()) or bool(torch.isnan(_sw).any()):
-                    _bad_v2a.append(
-                        {"idx": _si, "inf": True, "inf_count": int(torch.isinf(_sw).sum()), "numel": _sw.numel()}
-                    )
-                _sst = _sb.scale_shift_table
-                _sst_absmax = float(_sst.float().abs().max())
-                if _sst_absmax > 100 or bool(torch.isinf(_sst).any()) or bool(torch.isnan(_sst).any()):
-                    _bad_sst.append(
-                        {
-                            "idx": _si,
-                            "absmax": round(_sst_absmax, 2),
-                            "inf": bool(torch.isinf(_sst).any()),
-                            "nan": bool(torch.isnan(_sst).any()),
-                        }
-                    )
+                for _pname, _pval in _sb.named_parameters():
+                    if bool(torch.isinf(_pval).any()) or bool(torch.isnan(_pval).any()):
+                        _bad_params.append(
+                            {
+                                "block": _si,
+                                "param": _pname,
+                                "inf": bool(torch.isinf(_pval).any()),
+                                "nan": bool(torch.isnan(_pval).any()),
+                                "inf_count": int(torch.isinf(_pval).sum()),
+                                "numel": _pval.numel(),
+                            }
+                        )
             log_event(
                 "ltx2_transformer:forward:weight_scan",
-                f"Scanned all {len(self.transformer_blocks)} blocks",
+                f"Scanned all {len(self.transformer_blocks)} blocks (full param scan)",
                 data={
                     "total_blocks": len(self.transformer_blocks),
-                    "bad_v2a_to_out": _bad_v2a,
-                    "bad_scale_shift_table": _bad_sst,
-                    "num_bad_v2a": len(_bad_v2a),
-                    "num_bad_sst": len(_bad_sst),
+                    "bad_params": _bad_params,
+                    "num_bad": len(_bad_params),
                 },
                 hypothesis_id="H20",
             )
@@ -2220,6 +2219,13 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_rotary_emb = (_rope_cpu[1][0].to(_rope_device), _rope_cpu[1][1].to(_rope_device))
             video_cross_attn_rotary_emb = (_rope_cpu[2][0].to(_rope_device), _rope_cpu[2][1].to(_rope_device))
             audio_cross_attn_rotary_emb = (_rope_cpu[3][0].to(_rope_device), _rope_cpu[3][1].to(_rope_device))
+
+            # Restore all block parameters from CPU backup to avoid XPU allocator corruption
+            _n_restored = 0
+            for _pname, _pval in block.named_parameters():
+                _key = f"{_block_idx}.{_pname}"
+                _pval.data = _param_cpu_backup[_key].to(_pval.device)
+                _n_restored += 1
             # #region agent log
             # Dynamic block trace: enable for the 2 blocks before the previous NaN block
             _prev_nan_block = getattr(self, "_prev_nan_block", 39)
@@ -2228,26 +2234,19 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 block._trace_nan = True
             if _do_nan_trace and _block_idx == _prev_nan_block:
                 _v2a_w = block.video_to_audio_attn.to_out[0].weight
-                _v2a_w_dev = str(_v2a_w.device)
                 _v2a_w_inf = bool(torch.isinf(_v2a_w).any())
                 _v2a_w_nan = bool(torch.isnan(_v2a_w).any())
-                _v2a_w_absmax = float(_v2a_w.float().abs().max()) if not _v2a_w_inf else "inf"
-                _v2a_w_inf_count = int(torch.isinf(_v2a_w).sum()) if _v2a_w_inf else 0
-                _v2a_w_numel = _v2a_w.numel()
                 log_event(
                     "ltx2_transformer:forward:v2a_weight_check",
-                    f"V2A to_out weight check before block {_block_idx}",
+                    f"V2A to_out weight after restore, block {_block_idx}",
                     data={
                         "block_idx": _block_idx,
-                        "device": _v2a_w_dev,
-                        "weight_shape": list(_v2a_w.shape),
-                        "weight_dtype": str(_v2a_w.dtype),
+                        "device": str(_v2a_w.device),
                         "weight_inf": _v2a_w_inf,
                         "weight_nan": _v2a_w_nan,
-                        "weight_absmax": _v2a_w_absmax,
-                        "inf_count": _v2a_w_inf_count,
-                        "total_elements": _v2a_w_numel,
-                        "inf_pct": round(_v2a_w_inf_count / _v2a_w_numel * 100, 4) if _v2a_w_inf else 0,
+                        "weight_absmax": float(_v2a_w.float().abs().max()) if not _v2a_w_inf else "inf",
+                        "restored_from_cpu": True,
+                        "params_restored": _n_restored,
                     },
                     hypothesis_id="H20",
                 )
