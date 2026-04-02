@@ -2164,6 +2164,37 @@ class LTX2VideoTransformer3DModel(nn.Module):
 
         # #region agent log
         if _do_nan_trace:
+            _bad_v2a = []
+            _bad_sst = []
+            for _si, _sb in enumerate(self.transformer_blocks):
+                _sw = _sb.video_to_audio_attn.to_out[0].weight
+                if bool(torch.isinf(_sw).any()) or bool(torch.isnan(_sw).any()):
+                    _bad_v2a.append(
+                        {"idx": _si, "inf": True, "inf_count": int(torch.isinf(_sw).sum()), "numel": _sw.numel()}
+                    )
+                _sst = _sb.scale_shift_table
+                _sst_absmax = float(_sst.float().abs().max())
+                if _sst_absmax > 100 or bool(torch.isinf(_sst).any()) or bool(torch.isnan(_sst).any()):
+                    _bad_sst.append(
+                        {
+                            "idx": _si,
+                            "absmax": round(_sst_absmax, 2),
+                            "inf": bool(torch.isinf(_sst).any()),
+                            "nan": bool(torch.isnan(_sst).any()),
+                        }
+                    )
+            log_event(
+                "ltx2_transformer:forward:weight_scan",
+                f"Scanned all {len(self.transformer_blocks)} blocks",
+                data={
+                    "total_blocks": len(self.transformer_blocks),
+                    "bad_v2a_to_out": _bad_v2a,
+                    "bad_scale_shift_table": _bad_sst,
+                    "num_bad_v2a": len(_bad_v2a),
+                    "num_bad_sst": len(_bad_sst),
+                },
+                hypothesis_id="H20",
+            )
             log_event(
                 "ltx2_transformer:forward:before_blocks",
                 "all pre-block tensors ready",
@@ -2195,6 +2226,31 @@ class LTX2VideoTransformer3DModel(nn.Module):
             _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
             if _do_nan_trace and _block_idx in _trace_blocks:
                 block._trace_nan = True
+            if _do_nan_trace and _block_idx == _prev_nan_block:
+                _v2a_w = block.video_to_audio_attn.to_out[0].weight
+                _v2a_w_dev = str(_v2a_w.device)
+                _v2a_w_inf = bool(torch.isinf(_v2a_w).any())
+                _v2a_w_nan = bool(torch.isnan(_v2a_w).any())
+                _v2a_w_absmax = float(_v2a_w.float().abs().max()) if not _v2a_w_inf else "inf"
+                _v2a_w_inf_count = int(torch.isinf(_v2a_w).sum()) if _v2a_w_inf else 0
+                _v2a_w_numel = _v2a_w.numel()
+                log_event(
+                    "ltx2_transformer:forward:v2a_weight_check",
+                    f"V2A to_out weight check before block {_block_idx}",
+                    data={
+                        "block_idx": _block_idx,
+                        "device": _v2a_w_dev,
+                        "weight_shape": list(_v2a_w.shape),
+                        "weight_dtype": str(_v2a_w.dtype),
+                        "weight_inf": _v2a_w_inf,
+                        "weight_nan": _v2a_w_nan,
+                        "weight_absmax": _v2a_w_absmax,
+                        "inf_count": _v2a_w_inf_count,
+                        "total_elements": _v2a_w_numel,
+                        "inf_pct": round(_v2a_w_inf_count / _v2a_w_numel * 100, 4) if _v2a_w_inf else 0,
+                    },
+                    hypothesis_id="H20",
+                )
             # #endregion
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
