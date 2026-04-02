@@ -2162,11 +2162,14 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
         audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
-        # Save CPU backup of all block parameters to protect against XPU allocator corruption
-        _param_cpu_backup: dict[str, torch.Tensor] = {}
-        for _si, _sb in enumerate(self.transformer_blocks):
-            for _pname, _pval in _sb.named_parameters():
-                _param_cpu_backup[f"{_si}.{_pname}"] = _pval.data.cpu()
+        # Save CPU backup of all block parameters ONCE to protect against XPU allocator corruption.
+        # Reuse the same backup across all forward() calls so we never back up corrupted weights.
+        if not hasattr(self, "_param_cpu_backup"):
+            self._param_cpu_backup: dict[str, torch.Tensor] = {}
+            for _si, _sb in enumerate(self.transformer_blocks):
+                for _pname, _pval in _sb.named_parameters():
+                    self._param_cpu_backup[f"{_si}.{_pname}"] = _pval.data.cpu()
+        _param_cpu_backup = self._param_cpu_backup
 
         # #region agent log
         if _do_nan_trace:
