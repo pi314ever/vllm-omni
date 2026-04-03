@@ -2288,6 +2288,12 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # 5. Run transformer blocks
         _nan_found_at_block = -1
         for _block_idx, block in enumerate(self.transformer_blocks):
+            # H24 fix: Clone activations BEFORE RoPE/param restoration.
+            # The restoration creates thousands of GPU allocations which cause the
+            # XPU caching allocator to reclaim memory backing these tensors.
+            hidden_states = hidden_states.clone()
+            audio_hidden_states = audio_hidden_states.clone()
+
             # Refresh RoPE tensors from CPU backup to avoid XPU allocator corruption
             video_rotary_emb = (_rope_cpu[0][0].to(_rope_device), _rope_cpu[0][1].to(_rope_device))
             audio_rotary_emb = (_rope_cpu[1][0].to(_rope_device), _rope_cpu[1][1].to(_rope_device))
@@ -2300,32 +2306,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 _key = f"{_block_idx}.{_pname}"
                 _pval.data = _param_cpu_backup[_key].to(_pval.device)
                 _n_restored += 1
-            # #region agent log
-            # H23: Check shared intermediate tensors for corruption during block loop
-            if _do_nan_trace and _block_idx % 3 == 0:
-                _shared_check = {}
-                for _sname, _stensor in [
-                    ("temb_audio", temb_audio),
-                    ("audio_cross_attn_ss", audio_cross_attn_scale_shift),
-                    ("audio_cross_attn_v2a_gate", audio_cross_attn_v2a_gate),
-                    ("audio_enc_hs", audio_encoder_hidden_states),
-                    ("temb", temb),
-                    ("video_cross_attn_ss", video_cross_attn_scale_shift),
-                    ("enc_hs", encoder_hidden_states),
-                ]:
-                    _snan = bool(torch.isnan(_stensor).any())
-                    _sinf = bool(torch.isinf(_stensor).any())
-                    _sabsmax = float(_stensor.float().abs().max()) if not (_snan or _sinf) else "bad"
-                    _shared_check[_sname] = {"nan": _snan, "inf": _sinf, "absmax": _sabsmax}
-                if any(v["nan"] or v["inf"] for v in _shared_check.values()):
-                    log_event(
-                        "ltx2_transformer:forward:shared_tensor_corrupt",
-                        f"SHARED TENSOR CORRUPTED at block {_block_idx} (call {_fwd_call_idx})",
-                        data={"fwd_call_idx": _fwd_call_idx, "block_idx": _block_idx, "shared_check": _shared_check},
-                        hypothesis_id="H23",
-                    )
-            # #endregion
-            # #region agent log
             _prev_nan_block = getattr(self, "_prev_nan_block", 39)
             _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
             # H24: Also trace blocks 1-2 during call 1 to diagnose audio explosion
