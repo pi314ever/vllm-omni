@@ -2328,7 +2328,11 @@ class LTX2VideoTransformer3DModel(nn.Module):
             # #region agent log
             _prev_nan_block = getattr(self, "_prev_nan_block", 39)
             _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
-            if _do_nan_trace and _fwd_call_idx == 0 and _block_idx in _trace_blocks:
+            # H24: Also trace blocks 1-2 during call 1 to diagnose audio explosion
+            _enable_sub_trace = (_fwd_call_idx == 0 and _block_idx in _trace_blocks) or (
+                _fwd_call_idx == 1 and _block_idx in {1, 2}
+            )
+            if _do_nan_trace and _enable_sub_trace:
                 block._trace_nan = True
             if _do_nan_trace and _fwd_call_idx == 0 and _block_idx == _prev_nan_block:
                 _v2a_w = block.video_to_audio_attn.to_out[0].weight
@@ -2390,7 +2394,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 )
 
             # #region agent log
-            if _do_nan_trace and _fwd_call_idx == 0 and _block_idx in _trace_blocks:
+            if _do_nan_trace and _enable_sub_trace:
                 block._trace_nan = False
             if _do_nan_trace and _nan_found_at_block < 0:
                 _v_nan = bool(torch.isnan(hidden_states).any())
@@ -2398,8 +2402,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 _v_absmax = float(hidden_states.float().abs().max())
                 _a_absmax = float(audio_hidden_states.float().abs().max())
                 _log_this = _block_idx % 5 == 0 or _v_absmax > 1e6 or _a_absmax > 1e6 or _v_nan or _a_nan
-                if _fwd_call_idx >= 1:
-                    _log_this = True  # log every block for calls after the first
+                if _fwd_call_idx == 1 and _block_idx <= 5:
+                    _log_this = True  # log blocks 0-5 for call 1 (audio explosion zone)
                 if _log_this:
                     log_event(
                         "ltx2_transformer:forward:block_stats",
