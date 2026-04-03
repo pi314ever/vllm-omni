@@ -2301,6 +2301,31 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 _pval.data = _param_cpu_backup[_key].to(_pval.device)
                 _n_restored += 1
             # #region agent log
+            # H23: Check shared intermediate tensors for corruption during block loop
+            if _do_nan_trace and _block_idx % 3 == 0:
+                _shared_check = {}
+                for _sname, _stensor in [
+                    ("temb_audio", temb_audio),
+                    ("audio_cross_attn_ss", audio_cross_attn_scale_shift),
+                    ("audio_cross_attn_v2a_gate", audio_cross_attn_v2a_gate),
+                    ("audio_enc_hs", audio_encoder_hidden_states),
+                    ("temb", temb),
+                    ("video_cross_attn_ss", video_cross_attn_scale_shift),
+                    ("enc_hs", encoder_hidden_states),
+                ]:
+                    _snan = bool(torch.isnan(_stensor).any())
+                    _sinf = bool(torch.isinf(_stensor).any())
+                    _sabsmax = float(_stensor.float().abs().max()) if not (_snan or _sinf) else "bad"
+                    _shared_check[_sname] = {"nan": _snan, "inf": _sinf, "absmax": _sabsmax}
+                if any(v["nan"] or v["inf"] for v in _shared_check.values()):
+                    log_event(
+                        "ltx2_transformer:forward:shared_tensor_corrupt",
+                        f"SHARED TENSOR CORRUPTED at block {_block_idx} (call {_fwd_call_idx})",
+                        data={"fwd_call_idx": _fwd_call_idx, "block_idx": _block_idx, "shared_check": _shared_check},
+                        hypothesis_id="H23",
+                    )
+            # #endregion
+            # #region agent log
             _prev_nan_block = getattr(self, "_prev_nan_block", 39)
             _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
             if _do_nan_trace and _fwd_call_idx == 0 and _block_idx in _trace_blocks:
@@ -2372,7 +2397,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 _a_nan = bool(torch.isnan(audio_hidden_states).any())
                 _v_absmax = float(hidden_states.float().abs().max())
                 _a_absmax = float(audio_hidden_states.float().abs().max())
-                if _block_idx % 5 == 0 or _v_absmax > 1e6 or _a_absmax > 1e6 or _v_nan or _a_nan:
+                _log_this = _block_idx % 5 == 0 or _v_absmax > 1e6 or _a_absmax > 1e6 or _v_nan or _a_nan
+                if _fwd_call_idx >= 1:
+                    _log_this = True  # log every block for calls after the first
+                if _log_this:
                     log_event(
                         "ltx2_transformer:forward:block_stats",
                         f"block {_block_idx} stats (call {_fwd_call_idx})",
