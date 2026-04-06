@@ -1333,7 +1333,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
                 pbar.update()
                 # #region agent log
-                if i == 0 or i == len(timesteps) - 1:
+                if i == 0 or i == len(timesteps) - 1 or i == len(timesteps) // 2:
                     log_event(
                         f"pipeline_ltx2.py:forward:step_{i}_latent_stats",
                         f"latent stats after step {i}",
