@@ -2048,9 +2048,9 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_coords[:, 0:1, :], device=audio_hidden_states.device
         )
 
-        # NOTE(Daniel): XPU caching allocator corrupts sin tensors during CPU offload
-        # memory churn.  Stash on CPU and re-copy to GPU before each block.
-        _rope_device = hidden_states.device
+        # NOTE(Daniel): XPU caching allocator corrupts tensors during heavy GPU
+        # memory churn from param restoration.  Keep CPU copies for refresh via
+        # copy_() into pre-allocated GPU buffers (no new GPU allocations).
         _rope_cpu = (
             (video_rotary_emb[0].cpu(), video_rotary_emb[1].cpu()),
             (audio_rotary_emb[0].cpu(), audio_rotary_emb[1].cpu()),
@@ -2148,7 +2148,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
         # #endregion
 
-        # Restore ALL non-block params from CPU backup before use (XPU allocator corrupts them over time)
+        # Restore ALL non-block params from CPU backup via copy_() (zero GPU allocation)
         if hasattr(self, "_nonblock_cpu_backup"):
             _nb_mods = {
                 "proj_in": self.proj_in,
@@ -2170,10 +2170,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 for _on, _pv in _mod.named_parameters():
                     _key = f"{_mn}.{_on}"
                     if _key in self._nonblock_cpu_backup:
-                        _pv.data = self._nonblock_cpu_backup[_key].to(_pv.device)
+                        _pv.data.copy_(self._nonblock_cpu_backup[_key])
             for _tn in ("scale_shift_table", "audio_scale_shift_table"):
                 if _tn in self._nonblock_cpu_backup:
-                    getattr(self, _tn).data = self._nonblock_cpu_backup[_tn].to(getattr(self, _tn).device)
+                    getattr(self, _tn).data.copy_(self._nonblock_cpu_backup[_tn])
 
         # 2. Patchify input projections
         hidden_states = self.proj_in(hidden_states)
@@ -2337,43 +2337,49 @@ class LTX2VideoTransformer3DModel(nn.Module):
             )
         # #endregion
 
-        # Protect post-loop tensors from allocator corruption during the block loop
-        embedded_timestep = embedded_timestep.clone()
-        audio_embedded_timestep = audio_embedded_timestep.clone()
-
         # 5. Run transformer blocks
         _nan_found_at_block = -1
         for _block_idx, block in enumerate(self.transformer_blocks):
-            # H24/H25 fix: Clone ALL GPU tensors that persist across blocks BEFORE
-            # RoPE/param restoration. The restoration creates thousands of GPU allocations
-            # which cause the XPU caching allocator to reclaim memory backing these tensors.
-            hidden_states = hidden_states.clone()
-            audio_hidden_states = audio_hidden_states.clone()
-            encoder_hidden_states = encoder_hidden_states.clone()
-            audio_encoder_hidden_states = audio_encoder_hidden_states.clone()
-            temb = temb.clone()
-            temb_audio = temb_audio.clone()
-            video_cross_attn_scale_shift = video_cross_attn_scale_shift.clone()
-            audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.clone()
-            video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.clone()
-            audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.clone()
-            if encoder_attention_mask is not None:
-                encoder_attention_mask = encoder_attention_mask.clone()
-            if audio_encoder_attention_mask is not None:
-                audio_encoder_attention_mask = audio_encoder_attention_mask.clone()
+            # Refresh RoPE tensors from CPU backup via copy_() (zero GPU allocation)
+            video_rotary_emb[0].copy_(_rope_cpu[0][0])
+            video_rotary_emb[1].copy_(_rope_cpu[0][1])
+            audio_rotary_emb[0].copy_(_rope_cpu[1][0])
+            audio_rotary_emb[1].copy_(_rope_cpu[1][1])
+            video_cross_attn_rotary_emb[0].copy_(_rope_cpu[2][0])
+            video_cross_attn_rotary_emb[1].copy_(_rope_cpu[2][1])
+            audio_cross_attn_rotary_emb[0].copy_(_rope_cpu[3][0])
+            audio_cross_attn_rotary_emb[1].copy_(_rope_cpu[3][1])
 
-            # Refresh RoPE tensors from CPU backup to avoid XPU allocator corruption
-            video_rotary_emb = (_rope_cpu[0][0].to(_rope_device), _rope_cpu[0][1].to(_rope_device))
-            audio_rotary_emb = (_rope_cpu[1][0].to(_rope_device), _rope_cpu[1][1].to(_rope_device))
-            video_cross_attn_rotary_emb = (_rope_cpu[2][0].to(_rope_device), _rope_cpu[2][1].to(_rope_device))
-            audio_cross_attn_rotary_emb = (_rope_cpu[3][0].to(_rope_device), _rope_cpu[3][1].to(_rope_device))
-
-            # Restore all block parameters from CPU backup to avoid XPU allocator corruption
+            # Restore all block parameters via copy_() (zero GPU allocation)
             _n_restored = 0
             for _pname, _pval in block.named_parameters():
                 _key = f"{_block_idx}.{_pname}"
-                _pval.data = _param_cpu_backup[_key].to(_pval.device)
+                _pval.data.copy_(_param_cpu_backup[_key])
                 _n_restored += 1
+
+            # #region agent log
+            if _block_idx in (0, 23, 47) and _fwd_call_idx in (0, 1, 4, 9):
+                _hs_nan = bool(torch.isnan(hidden_states).any())
+                _ahs_nan = bool(torch.isnan(audio_hidden_states).any())
+                _rope_sin_ok = float(video_rotary_emb[1].float().abs().max()) <= 1.0 + 1e-3
+                log_event(
+                    "ltx2_transformer:copy_health",
+                    f"copy_() health block={_block_idx} call={_fwd_call_idx}",
+                    data={
+                        "fwd_call_idx": _fwd_call_idx,
+                        "block_idx": _block_idx,
+                        "hs_nan": _hs_nan,
+                        "ahs_nan": _ahs_nan,
+                        "rope_sin_absmax": round(float(video_rotary_emb[1].float().abs().max()), 6),
+                        "rope_sin_ok": _rope_sin_ok,
+                        "params_restored": _n_restored,
+                        "hs_absmax": round(float(hidden_states.float().abs().max()), 4),
+                        "ahs_absmax": round(float(audio_hidden_states.float().abs().max()), 4),
+                        "FIX": "copy_v1",
+                    },
+                    hypothesis_id="H_COPY",
+                )
+            # #endregion
             _prev_nan_block = getattr(self, "_prev_nan_block", 39)
             _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
             # H24: Also trace blocks 1-2 during call 1 to diagnose audio explosion
