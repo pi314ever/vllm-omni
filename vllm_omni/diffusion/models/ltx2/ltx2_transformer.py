@@ -2148,6 +2148,33 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
         # #endregion
 
+        # Restore ALL non-block params from CPU backup before use (XPU allocator corrupts them over time)
+        if hasattr(self, "_nonblock_cpu_backup"):
+            _nb_mods = {
+                "proj_in": self.proj_in,
+                "audio_proj_in": self.audio_proj_in,
+                "time_embed": self.time_embed,
+                "audio_time_embed": self.audio_time_embed,
+                "av_cross_attn_video_scale_shift": self.av_cross_attn_video_scale_shift,
+                "av_cross_attn_video_a2v_gate": self.av_cross_attn_video_a2v_gate,
+                "av_cross_attn_audio_scale_shift": self.av_cross_attn_audio_scale_shift,
+                "av_cross_attn_audio_v2a_gate": self.av_cross_attn_audio_v2a_gate,
+                "caption_projection": self.caption_projection,
+                "audio_caption_projection": self.audio_caption_projection,
+                "norm_out": self.norm_out,
+                "proj_out": self.proj_out,
+                "audio_norm_out": self.audio_norm_out,
+                "audio_proj_out": self.audio_proj_out,
+            }
+            for _mn, _mod in _nb_mods.items():
+                for _on, _pv in _mod.named_parameters():
+                    _key = f"{_mn}.{_on}"
+                    if _key in self._nonblock_cpu_backup:
+                        _pv.data = self._nonblock_cpu_backup[_key].to(_pv.device)
+            for _tn in ("scale_shift_table", "audio_scale_shift_table"):
+                if _tn in self._nonblock_cpu_backup:
+                    getattr(self, _tn).data = self._nonblock_cpu_backup[_tn].to(getattr(self, _tn).device)
+
         # 2. Patchify input projections
         hidden_states = self.proj_in(hidden_states)
         audio_hidden_states = self.audio_proj_in(audio_hidden_states)
@@ -2237,6 +2264,31 @@ class LTX2VideoTransformer3DModel(nn.Module):
             for _si, _sb in enumerate(self.transformer_blocks):
                 for _pname, _pval in _sb.named_parameters():
                     self._param_cpu_backup[f"{_si}.{_pname}"] = _pval.data.cpu()
+            # Also backup ALL non-block module parameters
+            self._nonblock_cpu_backup: dict[str, torch.Tensor] = {}
+            _nb_modules = {
+                "proj_in": self.proj_in,
+                "audio_proj_in": self.audio_proj_in,
+                "time_embed": self.time_embed,
+                "audio_time_embed": self.audio_time_embed,
+                "av_cross_attn_video_scale_shift": self.av_cross_attn_video_scale_shift,
+                "av_cross_attn_video_a2v_gate": self.av_cross_attn_video_a2v_gate,
+                "av_cross_attn_audio_scale_shift": self.av_cross_attn_audio_scale_shift,
+                "av_cross_attn_audio_v2a_gate": self.av_cross_attn_audio_v2a_gate,
+                "caption_projection": self.caption_projection,
+                "audio_caption_projection": self.audio_caption_projection,
+                "norm_out": self.norm_out,
+                "proj_out": self.proj_out,
+                "audio_norm_out": self.audio_norm_out,
+                "audio_proj_out": self.audio_proj_out,
+            }
+            for _mod_name, _mod in _nb_modules.items():
+                for _pname, _pval in _mod.named_parameters():
+                    self._nonblock_cpu_backup[f"{_mod_name}.{_pname}"] = _pval.data.cpu()
+            for _tbl_name in ("scale_shift_table", "audio_scale_shift_table"):
+                _tbl = getattr(self, _tbl_name, None)
+                if _tbl is not None:
+                    self._nonblock_cpu_backup[_tbl_name] = _tbl.data.cpu()
         _param_cpu_backup = self._param_cpu_backup
 
         # #region agent log
