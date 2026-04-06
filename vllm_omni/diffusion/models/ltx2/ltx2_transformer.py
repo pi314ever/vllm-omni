@@ -2337,14 +2337,30 @@ class LTX2VideoTransformer3DModel(nn.Module):
             )
         # #endregion
 
+        # Protect post-loop tensors from allocator corruption during the block loop
+        embedded_timestep = embedded_timestep.clone()
+        audio_embedded_timestep = audio_embedded_timestep.clone()
+
         # 5. Run transformer blocks
         _nan_found_at_block = -1
         for _block_idx, block in enumerate(self.transformer_blocks):
-            # H24 fix: Clone activations BEFORE RoPE/param restoration.
-            # The restoration creates thousands of GPU allocations which cause the
-            # XPU caching allocator to reclaim memory backing these tensors.
+            # H24/H25 fix: Clone ALL GPU tensors that persist across blocks BEFORE
+            # RoPE/param restoration. The restoration creates thousands of GPU allocations
+            # which cause the XPU caching allocator to reclaim memory backing these tensors.
             hidden_states = hidden_states.clone()
             audio_hidden_states = audio_hidden_states.clone()
+            encoder_hidden_states = encoder_hidden_states.clone()
+            audio_encoder_hidden_states = audio_encoder_hidden_states.clone()
+            temb = temb.clone()
+            temb_audio = temb_audio.clone()
+            video_cross_attn_scale_shift = video_cross_attn_scale_shift.clone()
+            audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.clone()
+            video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.clone()
+            audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.clone()
+            if encoder_attention_mask is not None:
+                encoder_attention_mask = encoder_attention_mask.clone()
+            if audio_encoder_attention_mask is not None:
+                audio_encoder_attention_mask = audio_encoder_attention_mask.clone()
 
             # Refresh RoPE tensors from CPU backup to avoid XPU allocator corruption
             video_rotary_emb = (_rope_cpu[0][0].to(_rope_device), _rope_cpu[0][1].to(_rope_device))
