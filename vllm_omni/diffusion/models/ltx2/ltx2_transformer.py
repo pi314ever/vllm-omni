@@ -2170,10 +2170,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 for _on, _pv in _mod.named_parameters():
                     _key = f"{_mn}.{_on}"
                     if _key in self._nonblock_cpu_backup:
-                        _pv.data.copy_(self._nonblock_cpu_backup[_key])
+                        _pv.data.copy_(self._nonblock_cpu_backup[_key], non_blocking=False)
             for _tn in ("scale_shift_table", "audio_scale_shift_table"):
                 if _tn in self._nonblock_cpu_backup:
-                    getattr(self, _tn).data.copy_(self._nonblock_cpu_backup[_tn])
+                    getattr(self, _tn).data.copy_(self._nonblock_cpu_backup[_tn], non_blocking=False)
 
         # 2. Patchify input projections
         hidden_states = self.proj_in(hidden_states)
@@ -2341,20 +2341,20 @@ class LTX2VideoTransformer3DModel(nn.Module):
         _nan_found_at_block = -1
         for _block_idx, block in enumerate(self.transformer_blocks):
             # Refresh RoPE tensors from CPU backup via copy_() (zero GPU allocation)
-            video_rotary_emb[0].copy_(_rope_cpu[0][0])
-            video_rotary_emb[1].copy_(_rope_cpu[0][1])
-            audio_rotary_emb[0].copy_(_rope_cpu[1][0])
-            audio_rotary_emb[1].copy_(_rope_cpu[1][1])
-            video_cross_attn_rotary_emb[0].copy_(_rope_cpu[2][0])
-            video_cross_attn_rotary_emb[1].copy_(_rope_cpu[2][1])
-            audio_cross_attn_rotary_emb[0].copy_(_rope_cpu[3][0])
-            audio_cross_attn_rotary_emb[1].copy_(_rope_cpu[3][1])
+            video_rotary_emb[0].copy_(_rope_cpu[0][0], non_blocking=False)
+            video_rotary_emb[1].copy_(_rope_cpu[0][1], non_blocking=False)
+            audio_rotary_emb[0].copy_(_rope_cpu[1][0], non_blocking=False)
+            audio_rotary_emb[1].copy_(_rope_cpu[1][1], non_blocking=False)
+            video_cross_attn_rotary_emb[0].copy_(_rope_cpu[2][0], non_blocking=False)
+            video_cross_attn_rotary_emb[1].copy_(_rope_cpu[2][1], non_blocking=False)
+            audio_cross_attn_rotary_emb[0].copy_(_rope_cpu[3][0], non_blocking=False)
+            audio_cross_attn_rotary_emb[1].copy_(_rope_cpu[3][1], non_blocking=False)
 
             # Restore all block parameters via copy_() (zero GPU allocation)
             _n_restored = 0
             for _pname, _pval in block.named_parameters():
                 _key = f"{_block_idx}.{_pname}"
-                _pval.data.copy_(_param_cpu_backup[_key])
+                _pval.data.copy_(_param_cpu_backup[_key], non_blocking=False)
                 _n_restored += 1
 
             # #region agent log
@@ -2362,6 +2362,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 _hs_nan = bool(torch.isnan(hidden_states).any())
                 _ahs_nan = bool(torch.isnan(audio_hidden_states).any())
                 _rope_sin_ok = float(video_rotary_emb[1].float().abs().max()) <= 1.0 + 1e-3
+                _sample_param = next(block.parameters())
                 log_event(
                     "ltx2_transformer:copy_health",
                     f"copy_() health block={_block_idx} call={_fwd_call_idx}",
@@ -2375,7 +2376,11 @@ class LTX2VideoTransformer3DModel(nn.Module):
                         "params_restored": _n_restored,
                         "hs_absmax": round(float(hidden_states.float().abs().max()), 4),
                         "ahs_absmax": round(float(audio_hidden_states.float().abs().max()), 4),
-                        "FIX": "copy_v1",
+                        "hs_device": str(hidden_states.device),
+                        "ahs_device": str(audio_hidden_states.device),
+                        "param_device": str(_sample_param.device),
+                        "rope_device": str(video_rotary_emb[0].device),
+                        "FIX": "copy_v2",
                     },
                     hypothesis_id="H_COPY",
                 )

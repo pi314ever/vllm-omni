@@ -57,19 +57,60 @@ class SequentialOffloadHook(ModelHook):
         transformer blocks, thus `module.to(device)` will fail for recursion calling,
         refer to
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
+
+        For XPU devices, reuses persistent GPU buffers via copy_() to avoid
+        allocation churn that corrupts the XPU caching allocator.
         """
+        _reuse_gpu = target_device.type == "xpu"
+        _n_reused, _n_fresh, _n_skip = 0, 0, 0
         for p in module.parameters():
             if p.data.device != target_device:
-                data = p.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
-                    data = data.pin_memory()
-                p.data = data
+                if _reuse_gpu and hasattr(p, "_xpu_buffer") and p._xpu_buffer.shape == p.data.shape:
+                    p._xpu_buffer.copy_(p.data, non_blocking=False)
+                    p.data = p._xpu_buffer
+                    _n_reused += 1
+                else:
+                    data = p.data.to(target_device, non_blocking=non_blocking)
+                    if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                        data = data.pin_memory()
+                    p.data = data
+                    if _reuse_gpu:
+                        p._xpu_buffer = p.data
+                    _n_fresh += 1
+            else:
+                _n_skip += 1
         for b in module.buffers():
             if b.device != target_device:
-                data = b.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
-                    data = data.pin_memory()
-                b.data = data
+                if _reuse_gpu and hasattr(b, "_xpu_buffer") and b._xpu_buffer.shape == b.data.shape:
+                    b._xpu_buffer.copy_(b.data, non_blocking=False)
+                    b.data = b._xpu_buffer
+                    _n_reused += 1
+                else:
+                    data = b.data.to(target_device, non_blocking=non_blocking)
+                    if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                        data = data.pin_memory()
+                    b.data = data
+                    if _reuse_gpu:
+                        b._xpu_buffer = b.data
+                    _n_fresh += 1
+            else:
+                _n_skip += 1
+        # #region agent log
+        if _n_reused + _n_fresh > 0:
+            log_event(
+                "sequential_backend.py:_move_params",
+                f"move_params to {target_device}",
+                data={
+                    "module": module.__class__.__name__,
+                    "target": str(target_device),
+                    "reused": _n_reused,
+                    "fresh_alloc": _n_fresh,
+                    "skipped": _n_skip,
+                    "xpu_reuse_enabled": _reuse_gpu,
+                },
+                hypothesis_id="H6",
+            )
+        # #endregion
 
     def _to_cpu(self, module: nn.Module) -> None:
         try:
