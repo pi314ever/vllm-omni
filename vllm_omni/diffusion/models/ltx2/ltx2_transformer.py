@@ -2350,11 +2350,13 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_cross_attn_rotary_emb[0].copy_(_rope_cpu[3][0], non_blocking=False)
             audio_cross_attn_rotary_emb[1].copy_(_rope_cpu[3][1], non_blocking=False)
 
-            # Restore all block parameters via copy_() (zero GPU allocation)
+            # Restore all block parameters via .to(device) (forces fresh GPU allocation
+            # that the XPU caching allocator correctly tracks; copy_() into bulk-allocated
+            # offload buffers fails because the allocator loses track of them).
             _n_restored = 0
             for _pname, _pval in block.named_parameters():
                 _key = f"{_block_idx}.{_pname}"
-                _pval.data.copy_(_param_cpu_backup[_key], non_blocking=False)
+                _pval.data = _param_cpu_backup[_key].to(_pval.device)
                 _n_restored += 1
 
             # #region agent log
