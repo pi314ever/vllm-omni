@@ -2340,6 +2340,12 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # 5. Run transformer blocks
         _nan_found_at_block = -1
         for _block_idx, block in enumerate(self.transformer_blocks):
+            # Clone outputs that carry state between blocks BEFORE param restoration,
+            # which creates 64 GPU allocs that can cause the XPU allocator to reclaim
+            # memory backing these tensors.
+            hidden_states = hidden_states.clone()
+            audio_hidden_states = audio_hidden_states.clone()
+
             # Refresh RoPE tensors from CPU backup via copy_() (zero GPU allocation)
             video_rotary_emb[0].copy_(_rope_cpu[0][0], non_blocking=False)
             video_rotary_emb[1].copy_(_rope_cpu[0][1], non_blocking=False)
