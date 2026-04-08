@@ -2341,35 +2341,22 @@ class LTX2VideoTransformer3DModel(nn.Module):
         _nan_found_at_block = -1
         _corruption_detected = False
         for _block_idx, block in enumerate(self.transformer_blocks):
-            # Clone only tensors that change between blocks (block outputs)
             hidden_states = hidden_states.clone()
             audio_hidden_states = audio_hidden_states.clone()
-
-            # #region agent log — H_INPLACE: track read-only tensors WITHOUT cloning
-            _ro_map = {
-                "enc_hs": encoder_hidden_states,
-                "audio_enc_hs": audio_encoder_hidden_states,
-                "temb": temb,
-                "temb_audio": temb_audio,
-                "v_ca_ss": video_cross_attn_scale_shift,
-                "a_ca_ss": audio_cross_attn_scale_shift,
-                "v_ca_gate": video_cross_attn_a2v_gate,
-                "a_ca_gate": audio_cross_attn_v2a_gate,
-                "emb_ts": embedded_timestep,
-                "audio_emb_ts": audio_embedded_timestep,
-            }
+            encoder_hidden_states = encoder_hidden_states.clone()
+            audio_encoder_hidden_states = audio_encoder_hidden_states.clone()
+            temb = temb.clone()
+            temb_audio = temb_audio.clone()
+            video_cross_attn_scale_shift = video_cross_attn_scale_shift.clone()
+            audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.clone()
+            video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.clone()
+            audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.clone()
             if encoder_attention_mask is not None:
-                _ro_map["enc_mask"] = encoder_attention_mask
+                encoder_attention_mask = encoder_attention_mask.clone()
             if audio_encoder_attention_mask is not None:
-                _ro_map["audio_enc_mask"] = audio_encoder_attention_mask
-            _ro_pre: dict[str, dict] = {}
-            for _rn, _rt in _ro_map.items():
-                _ro_pre[_rn] = {"ptr": _rt.data_ptr(), "sum": float(_rt.float().sum())}
-            _rope_pre = {
-                "v_cos": {"ptr": video_rotary_emb[0].data_ptr(), "sum": float(video_rotary_emb[0].float().sum())},
-                "v_sin": {"ptr": video_rotary_emb[1].data_ptr(), "sum": float(video_rotary_emb[1].float().sum())},
-            }
-            # #endregion
+                audio_encoder_attention_mask = audio_encoder_attention_mask.clone()
+            embedded_timestep = embedded_timestep.clone()
+            audio_embedded_timestep = audio_embedded_timestep.clone()
 
             # Refresh RoPE tensors from CPU backup via copy_() (zero GPU allocation)
             video_rotary_emb[0].copy_(_rope_cpu[0][0], non_blocking=False)
@@ -2484,77 +2471,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     encoder_attention_mask,
                     audio_encoder_attention_mask,
                 )
-
-            # #region agent log — H_INPLACE: post-block corruption check
-            _ro_corrupted = []
-            for _rn, _pre in _ro_pre.items():
-                _rt = _ro_map[_rn]
-                _post_ptr = _rt.data_ptr()
-                _post_sum = float(_rt.float().sum())
-                if _post_ptr != _pre["ptr"]:
-                    _ro_corrupted.append(
-                        {
-                            "name": _rn,
-                            "issue": "data_ptr_changed",
-                            "ptr_before": hex(_pre["ptr"]),
-                            "ptr_after": hex(_post_ptr),
-                        }
-                    )
-                elif _pre["sum"] != 0 and abs(_post_sum - _pre["sum"]) > 1e-4 * abs(_pre["sum"]):
-                    _ro_corrupted.append(
-                        {"name": _rn, "issue": "values_changed", "sum_before": _pre["sum"], "sum_after": _post_sum}
-                    )
-                elif _pre["sum"] == 0 and abs(_post_sum) > 1e-6:
-                    _ro_corrupted.append(
-                        {"name": _rn, "issue": "values_changed", "sum_before": 0, "sum_after": _post_sum}
-                    )
-            for _rpn, _rpp in _rope_pre.items():
-                _rpe = video_rotary_emb[0] if _rpn == "v_cos" else video_rotary_emb[1]
-                _post_ptr = _rpe.data_ptr()
-                _post_sum = float(_rpe.float().sum())
-                if _post_ptr != _rpp["ptr"]:
-                    _ro_corrupted.append(
-                        {
-                            "name": f"rope_{_rpn}",
-                            "issue": "data_ptr_changed",
-                            "ptr_before": hex(_rpp["ptr"]),
-                            "ptr_after": hex(_post_ptr),
-                        }
-                    )
-                elif _rpp["sum"] != 0 and abs(_post_sum - _rpp["sum"]) > 1e-4 * abs(_rpp["sum"]):
-                    _ro_corrupted.append(
-                        {
-                            "name": f"rope_{_rpn}",
-                            "issue": "values_changed",
-                            "sum_before": _rpp["sum"],
-                            "sum_after": _post_sum,
-                        }
-                    )
-            if _ro_corrupted and not _corruption_detected:
-                _corruption_detected = True
-                log_event(
-                    "ltx2_transformer:H_INPLACE:corruption",
-                    f"Read-only tensor corruption at block {_block_idx}, call {_fwd_call_idx}",
-                    data={
-                        "fwd_call_idx": _fwd_call_idx,
-                        "block_idx": _block_idx,
-                        "corrupted": _ro_corrupted,
-                        "total_corrupted": len(_ro_corrupted),
-                    },
-                    hypothesis_id="H_INPLACE",
-                )
-            elif _block_idx in (0, 1, 47) and _fwd_call_idx == 0:
-                log_event(
-                    "ltx2_transformer:H_INPLACE:ok",
-                    f"Read-only tensors OK at block {_block_idx}, call {_fwd_call_idx}",
-                    data={
-                        "fwd_call_idx": _fwd_call_idx,
-                        "block_idx": _block_idx,
-                        "num_tracked": len(_ro_pre),
-                    },
-                    hypothesis_id="H_INPLACE",
-                )
-            # #endregion
 
             # #region agent log
             if _do_nan_trace and _enable_sub_trace:

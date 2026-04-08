@@ -1334,20 +1334,25 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 )
 
                 pbar.update()
-                # #region agent log
-                if i == 0 or i == len(timesteps) - 1 or i == len(timesteps) // 2:
-                    log_event(
-                        f"pipeline_ltx2.py:forward:step_{i}_latent_stats",
-                        f"latent stats after step {i}",
-                        data={
-                            "step": i,
-                            "total_steps": len(timesteps),
-                            "latents_stats": _tensor_stats(latents, f"latents_step_{i}"),
-                            "audio_latents_stats": _tensor_stats(audio_latents, f"audio_latents_step_{i}"),
-                            "cfg_parallel_ready": cfg_parallel_ready,
-                        },
-                        hypothesis_id="H1",
-                    )
+                # #region agent log — H_AUDIO_EXPLOSION: log every step
+                _a_absmax = float(audio_latents.float().abs().max())
+                _v_absmax = float(latents.float().abs().max())
+                _a_nan = bool(torch.isnan(audio_latents).any())
+                _v_nan = bool(torch.isnan(latents).any())
+                log_event(
+                    f"pipeline_ltx2.py:forward:step_{i}_latent_stats",
+                    f"latent stats after step {i}",
+                    data={
+                        "step": i,
+                        "total_steps": len(timesteps),
+                        "v_absmax": round(_v_absmax, 2),
+                        "a_absmax": round(_a_absmax, 2),
+                        "v_nan": _v_nan,
+                        "a_nan": _a_nan,
+                        "cfg_parallel_ready": cfg_parallel_ready,
+                    },
+                    hypothesis_id="H_AUDIO_EXPLOSION",
+                )
                 # #endregion
 
         # #region agent log
