@@ -95,7 +95,27 @@ class SequentialOffloadHook(ModelHook):
         except StopIteration:
             return
 
-        self._move_params(module, self.device, non_blocking=False)
+        # #region agent log
+        _gpu_method = "bulk_to"
+        # #endregion
+        try:
+            module.to(self.device)
+        except (RecursionError, RuntimeError):
+            # #region agent log
+            _gpu_method = "move_params_fallback"
+            # #endregion
+            self._move_params(module, self.device, non_blocking=False)
+        # #region agent log
+        log_event(
+            "sequential_backend.py:_to_gpu:done",
+            f"module moved to GPU via {_gpu_method}",
+            data={
+                "module": module.__class__.__name__,
+                "method": _gpu_method,
+            },
+            hypothesis_id="H_OOM_FIX",
+        )
+        # #endregion
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # #region agent log
