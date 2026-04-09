@@ -41,7 +41,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.debug_mem_logger import _tensor_stats, log_event
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
@@ -280,33 +279,6 @@ class TensorParallelRMSNorm(nn.Module):
         out = x_float * inv_rms
         if self.weight is not None:
             out = out * self.weight.float()
-        # #region agent log
-        if getattr(self, "_trace_norm", False) and bool(torch.isnan(out).any()):
-            _w = self.weight
-            log_event(
-                "tp_rmsnorm:NaN_detected",
-                "RMSNorm produced NaN",
-                data={
-                    "x_nan": bool(torch.isnan(x_float).any()),
-                    "x_absmax": round(float(x_float.abs().max()), 4),
-                    "local_sum_nan": bool(torch.isnan(local_sum).any()),
-                    "local_sum_val": round(float(local_sum.float().abs().max()), 4),
-                    "inv_rms_nan": bool(torch.isnan(inv_rms).any()),
-                    "inv_rms_val": round(float(inv_rms.float().abs().max()), 6)
-                    if not bool(torch.isnan(inv_rms).any())
-                    else "NaN",
-                    "weight_nan": bool(torch.isnan(_w).any()) if _w is not None else False,
-                    "weight_absmax": round(float(_w.float().abs().max()), 6) if _w is not None else None,
-                    "weight_shape": list(_w.shape) if _w is not None else None,
-                    "out_nan": True,
-                    "hidden_size": self.hidden_size,
-                    "global_hidden_size": self.global_hidden_size,
-                    "tp_size": self.tp_size,
-                },
-                hypothesis_id="H16",
-            )
-            self._trace_norm = False
-        # #endregion
         return out.to(dtype=x_dtype)
 
 
@@ -475,90 +447,13 @@ class LTX2AudioVideoAttnProcessor:
             is_self_attention=is_self_attention,
         )
 
-        # #region agent log
-        _attn_trace = getattr(attn, "_trace_attn", False)
-        if _attn_trace:
-
-            def _and(name, t):
-                ft = t.float()
-                return {
-                    "name": name,
-                    "nan": bool(torch.isnan(ft).any()),
-                    "min": round(float(ft.min()), 4),
-                    "max": round(float(ft.max()), 4),
-                    "absmax": round(float(ft.abs().max()), 4),
-                    "shape": list(t.shape),
-                }
-
-            log_event(
-                "ltx2_attn:after_qkv_proj",
-                "QKV projected",
-                data={
-                    "query": _and("q", query),
-                    "key": _and("k", key),
-                    "value": _and("v", value),
-                },
-                hypothesis_id="H11",
-            )
-        # #endregion
-
         query = attn.norm_q(query)
         key = attn.norm_k(key)
 
-        # #region agent log
-        if _attn_trace:
-            log_event(
-                "ltx2_attn:after_qk_norm",
-                "QK normalized",
-                data={
-                    "query": _and("q_norm", query),
-                    "key": _and("k_norm", key),
-                },
-                hypothesis_id="H11",
-            )
-        # #endregion
-
         if query_rotary_emb is not None:
-            # #region agent log
-            if _attn_trace:
-                _pre_cos, _pre_sin = query_rotary_emb
-                log_event(
-                    "ltx2_attn:rope_pre_slice",
-                    "RoPE before TP slice",
-                    data={
-                        "rope_type": attn.rope_type,
-                        "cos_shape": list(_pre_cos.shape),
-                        "cos_ndim": _pre_cos.ndim,
-                        "cos": _and("cos_pre", _pre_cos),
-                        "sin": _and("sin_pre", _pre_sin),
-                        "heads": attn.heads,
-                        "head_dim": attn.head_dim,
-                        "tp_size": get_tensor_model_parallel_world_size(),
-                        "tp_rank": get_tensor_model_parallel_rank(),
-                    },
-                    hypothesis_id="H12",
-                )
-            # #endregion
             query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
             if key_rotary_emb is not None:
                 key_rotary_emb = self._slice_rope_for_tp(key_rotary_emb, attn)
-            # #region agent log
-            if _attn_trace:
-                _post_cos, _post_sin = query_rotary_emb
-                log_event(
-                    "ltx2_attn:rope_post_slice",
-                    "RoPE after TP slice",
-                    data={
-                        "cos_shape": list(_post_cos.shape),
-                        "sin_shape": list(_post_sin.shape),
-                        "cos": _and("cos_post", _post_cos),
-                        "sin": _and("sin_post", _post_sin),
-                        "q_shape": list(query.shape),
-                        "q": _and("q_into_rope", query),
-                    },
-                    hypothesis_id="H12",
-                )
-            # #endregion
             if attn.rope_type == "interleaved":
                 query = apply_interleaved_rotary_emb(query, query_rotary_emb)
                 key = apply_interleaved_rotary_emb(
@@ -572,94 +467,15 @@ class LTX2AudioVideoAttnProcessor:
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
-        # #region agent log
-        if _attn_trace:
-            log_event(
-                "ltx2_attn:after_rope",
-                "RoPE applied",
-                data={
-                    "query": _and("q_rope", query),
-                    "key": _and("k_rope", key),
-                },
-                hypothesis_id="H11",
-            )
-        # #endregion
-
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         hidden_states = attn.attn(query, key, value, attn_metadata)
-
-        # #region agent log
-        if _attn_trace:
-            log_event(
-                "ltx2_attn:after_kernel",
-                "attention kernel done",
-                data={
-                    "attn_out": _and("attn_out", hidden_states),
-                },
-                hypothesis_id="H11",
-            )
-        # #endregion
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
-        # #region agent log
-        if _attn_trace:
-            _w = attn.to_out[0].weight
-            _w_nan = bool(torch.isnan(_w).any())
-            _w_inf = bool(torch.isinf(_w).any())
-            _w_absmax = float(_w.float().abs().max()) if not _w_nan else "NaN"
-            _hs_nan = bool(torch.isnan(hidden_states).any())
-            _hs_absmax = float(hidden_states.float().abs().max()) if not _hs_nan else "NaN"
-            _manual_result = hidden_states.float() @ _w.float().T
-            _manual_nan = bool(torch.isnan(_manual_result).any())
-            _manual_inf = bool(torch.isinf(_manual_result).any())
-            _manual_absmax = float(_manual_result.abs().max()) if not _manual_nan else "NaN"
-            _bf16_result = hidden_states @ _w.T
-            _bf16_nan = bool(torch.isnan(_bf16_result).any())
-            _bf16_inf = bool(torch.isinf(_bf16_result).any())
-            _bf16_absmax = float(_bf16_result.float().abs().max()) if not _bf16_nan else "NaN"
-            log_event(
-                "ltx2_attn:before_out_proj",
-                "pre out_proj check",
-                data={
-                    "hs_shape": list(hidden_states.shape),
-                    "hs_dtype": str(hidden_states.dtype),
-                    "hs_nan": _hs_nan,
-                    "hs_absmax": _hs_absmax,
-                    "hs_contiguous": hidden_states.is_contiguous(),
-                    "weight_shape": list(_w.shape),
-                    "weight_nan": _w_nan,
-                    "weight_inf": _w_inf,
-                    "weight_absmax": _w_absmax,
-                    "manual_f32_nan": _manual_nan,
-                    "manual_f32_inf": _manual_inf,
-                    "manual_f32_absmax": _manual_absmax,
-                    "bf16_matmul_nan": _bf16_nan,
-                    "bf16_matmul_inf": _bf16_inf,
-                    "bf16_matmul_absmax": _bf16_absmax,
-                },
-                hypothesis_id="H18",
-            )
-            del _manual_result, _bf16_result
-        # #endregion
-
         hidden_states = attn.to_out[0](hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
-
-        # #region agent log
-        if _attn_trace:
-            log_event(
-                "ltx2_attn:after_out_proj",
-                "output projection done",
-                data={
-                    "out": _and("out_proj", hidden_states),
-                },
-                hypothesis_id="H11",
-            )
-            attn._trace_attn = False
-        # #endregion
 
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
@@ -1014,22 +830,6 @@ class LTX2VideoTransformerBlock(nn.Module):
         a2v_cross_attention_mask: torch.Tensor | None = None,
         v2a_cross_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # #region agent log
-        _trace = getattr(self, "_trace_nan", False)
-
-        def _qnc(name, t):
-            if not _trace:
-                return None
-            ft = t.float()
-            return {
-                "name": name,
-                "nan": bool(torch.isnan(ft).any()),
-                "min": round(float(ft.min()), 4),
-                "max": round(float(ft.max()), 4),
-                "absmax": round(float(ft.abs().max()), 4),
-            }
-
-        # #endregion
         batch_size = hidden_states.size(0)
 
         # 1. Video and Audio Self-Attention
@@ -1042,43 +842,12 @@ class LTX2VideoTransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
 
-        # #region agent log
-        if _trace:
-            self.attn1._trace_attn = True
-            log_event(
-                "ltx2_block:before_video_self_attn",
-                "video self-attn inputs",
-                data={
-                    "hidden_states_in": _qnc("hs_in", hidden_states),
-                    "norm_hidden_states": _qnc("norm_hs", norm_hidden_states),
-                    "scale_msa": _qnc("scale_msa", scale_msa),
-                    "shift_msa": _qnc("shift_msa", shift_msa),
-                    "gate_msa": _qnc("gate_msa", gate_msa),
-                    "norm_hs_shape": list(norm_hidden_states.shape),
-                },
-                hypothesis_id="H19",
-            )
-        # #endregion
         attn_hidden_states = self.attn1(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=None,
             query_rotary_emb=video_rotary_emb,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa
-
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_video_self_attn",
-                "video self-attn done",
-                data={
-                    "hidden_states": _qnc("hs", hidden_states),
-                    "attn_output": _qnc("attn1_out", attn_hidden_states),
-                    "gate_msa": _qnc("gate_msa", gate_msa),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
 
         norm_audio_hidden_states = self.audio_norm1(audio_hidden_states)
 
@@ -1091,43 +860,12 @@ class LTX2VideoTransformerBlock(nn.Module):
         )
         norm_audio_hidden_states = norm_audio_hidden_states * (1 + audio_scale_msa) + audio_shift_msa
 
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:before_audio_attn1",
-                "input to audio_attn1",
-                data={
-                    "norm_audio_hs": _qnc("norm_audio_hs", norm_audio_hidden_states),
-                    "audio_scale_msa": _qnc("audio_scale_msa", audio_scale_msa),
-                    "audio_shift_msa": _qnc("audio_shift_msa", audio_shift_msa),
-                    "audio_gate_msa": _qnc("audio_gate_msa", audio_gate_msa),
-                },
-                hypothesis_id="H11",
-            )
-            self.audio_attn1._trace_attn = True
-            self.audio_attn1.norm_q._trace_norm = True
-            self.audio_attn1.norm_k._trace_norm = True
-        # #endregion
-
         attn_audio_hidden_states = self.audio_attn1(
             hidden_states=norm_audio_hidden_states,
             encoder_hidden_states=None,
             query_rotary_emb=audio_rotary_emb,
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * audio_gate_msa
-
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_audio_self_attn",
-                "audio self-attn done",
-                data={
-                    "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
-                    "attn_audio_output": _qnc("audio_attn1_out", attn_audio_hidden_states),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
 
         # 2. Video and Audio Cross-Attention with the text embeddings
         norm_hidden_states = self.norm2(hidden_states)
@@ -1139,19 +877,6 @@ class LTX2VideoTransformerBlock(nn.Module):
         )
         hidden_states = hidden_states + attn_hidden_states
 
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_video_cross_attn",
-                "video cross-attn with text done",
-                data={
-                    "hidden_states": _qnc("hs", hidden_states),
-                    "attn2_out": _qnc("attn2_out", attn_hidden_states),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
-
         norm_audio_hidden_states = self.audio_norm2(audio_hidden_states)
         attn_audio_hidden_states = self.audio_attn2(
             norm_audio_hidden_states,
@@ -1160,19 +885,6 @@ class LTX2VideoTransformerBlock(nn.Module):
             attention_mask=audio_encoder_attention_mask,
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
-
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_audio_cross_attn",
-                "audio cross-attn with text done",
-                data={
-                    "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
-                    "audio_attn2_out": _qnc("audio_attn2_out", attn_audio_hidden_states),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
         norm_hidden_states = self.audio_to_video_norm(hidden_states)
@@ -1229,20 +941,6 @@ class LTX2VideoTransformerBlock(nn.Module):
 
         hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_a2v_cross_attn",
-                "audio-to-video cross-attn done",
-                data={
-                    "hidden_states": _qnc("hs", hidden_states),
-                    "a2v_attn_out": _qnc("a2v_out", a2v_attn_hidden_states),
-                    "a2v_gate": _qnc("a2v_gate", a2v_gate),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
-
         # Video-to-Audio Cross Attention: Q: Audio; K,V: Video
         mod_norm_hidden_states = norm_hidden_states * (1 + video_v2a_ca_scale.squeeze(2)) + video_v2a_ca_shift.squeeze(
             2
@@ -1251,23 +949,6 @@ class LTX2VideoTransformerBlock(nn.Module):
             1 + audio_v2a_ca_scale.squeeze(2)
         ) + audio_v2a_ca_shift.squeeze(2)
 
-        # #region agent log
-        if _trace:
-            self.video_to_audio_attn._trace_attn = True
-            self.video_to_audio_attn.norm_q._trace_norm = True
-            self.video_to_audio_attn.norm_k._trace_norm = True
-            log_event(
-                "ltx2_block:before_v2a_cross_attn",
-                "v2a inputs",
-                data={
-                    "mod_norm_video_hs": _qnc("mod_norm_video", mod_norm_hidden_states),
-                    "mod_norm_audio_hs": _qnc("mod_norm_audio", mod_norm_audio_hidden_states),
-                    "v2a_ca_video_scale": _qnc("v2a_ca_v_scale", video_v2a_ca_scale),
-                    "v2a_ca_audio_scale": _qnc("v2a_ca_a_scale", audio_v2a_ca_scale),
-                },
-                hypothesis_id="H17",
-            )
-        # #endregion
         v2a_attn_hidden_states = self.video_to_audio_attn(
             mod_norm_audio_hidden_states,
             encoder_hidden_states=mod_norm_hidden_states,
@@ -1278,54 +959,14 @@ class LTX2VideoTransformerBlock(nn.Module):
 
         audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
 
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_v2a_cross_attn",
-                "video-to-audio cross-attn done",
-                data={
-                    "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
-                    "v2a_attn_out": _qnc("v2a_out", v2a_attn_hidden_states),
-                    "v2a_gate": _qnc("v2a_gate", v2a_gate),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
-
         # 4. Feedforward
         norm_hidden_states = self.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + ff_output * gate_mlp
 
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_video_ff",
-                "video FFN done",
-                data={
-                    "hidden_states": _qnc("hs", hidden_states),
-                    "ff_output": _qnc("ff_out", ff_output),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
-
         norm_audio_hidden_states = self.audio_norm3(audio_hidden_states) * (1 + audio_scale_mlp) + audio_shift_mlp
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
         audio_hidden_states = audio_hidden_states + audio_ff_output * audio_gate_mlp
-
-        # #region agent log
-        if _trace:
-            log_event(
-                "ltx2_block:after_audio_ff",
-                "audio FFN done",
-                data={
-                    "audio_hidden_states": _qnc("audio_hs", audio_hidden_states),
-                    "audio_ff_output": _qnc("audio_ff_out", audio_ff_output),
-                },
-                hypothesis_id="H10",
-            )
-        # #endregion
 
         return hidden_states, audio_hidden_states
 
@@ -1582,21 +1223,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             freqs_hp = freqs.double()
             cos_freq = freqs_hp.cos().to(orig_dtype)
             sin_freq = freqs_hp.sin().to(orig_dtype)
-            # #region agent log
-            log_event(
-                "rope_forward:split_trig",
-                "sin/cos computed",
-                data={
-                    "freqs_dtype": str(freqs.dtype),
-                    "hp_dtype": str(freqs_hp.dtype),
-                    "orig_dtype": str(orig_dtype),
-                    "cos_absmax": round(float(cos_freq.float().abs().max()), 6),
-                    "sin_absmax": round(float(sin_freq.float().abs().max()), 6),
-                    "FIX_VERSION": "double_v2",
-                },
-                hypothesis_id="H13",
-            )
-            # #endregion
 
             if pad_size != 0:
                 cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
@@ -1614,20 +1240,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
 
             cos_freqs = torch.swapaxes(cos_freq, 1, 2).contiguous()  # (B,H,T,D//2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2).contiguous()  # (B,H,T,D//2)
-            # #region agent log
-            log_event(
-                "rope_forward:split_final",
-                "after reshape+swapaxes+contiguous",
-                data={
-                    "cos_absmax": round(float(cos_freqs.float().abs().max()), 6),
-                    "sin_absmax": round(float(sin_freqs.float().abs().max()), 6),
-                    "cos_contiguous": cos_freqs.is_contiguous(),
-                    "sin_contiguous": sin_freqs.is_contiguous(),
-                    "FIX_VERSION": "contiguous_v1",
-                },
-                hypothesis_id="H14",
-            )
-            # #endregion
 
         return cos_freqs, sin_freqs
 
@@ -2058,96 +1670,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
             (audio_cross_attn_rotary_emb[0].cpu(), audio_cross_attn_rotary_emb[1].cpu()),
         )
 
-        # #region agent log
-        _fwd_call_idx = getattr(self, "_fwd_call_count", 0)
-        self._fwd_call_count = _fwd_call_idx + 1
-        _do_nan_trace = True  # trace every forward call
-
-        def _nc(name, t):
-            return {
-                "name": name,
-                "has_nan": bool(torch.isnan(t.float()).any()),
-                "has_inf": bool(torch.isinf(t.float()).any()),
-                "min": round(float(t.float().min()), 4),
-                "max": round(float(t.float().max()), 4),
-            }
-
-        _rope_check = {
-            "video_rotary_cos": _nc("v_rope_cos", video_rotary_emb[0]),
-            "video_rotary_sin": _nc("v_rope_sin", video_rotary_emb[1]),
-            "audio_rotary_cos": _nc("a_rope_cos", audio_rotary_emb[0]),
-            "audio_rotary_sin": _nc("a_rope_sin", audio_rotary_emb[1]),
-        }
-        log_event(
-            "ltx2_transformer:forward:after_rope",
-            f"RoPE embeddings computed (call {_fwd_call_idx})",
-            data={**_rope_check, "fwd_call_idx": _fwd_call_idx},
-            hypothesis_id="H9",
-        )
-
-        # H22a: Scan ALL non-block module parameters for corruption
-        _nonblock_modules = {
-            "proj_in": self.proj_in,
-            "audio_proj_in": self.audio_proj_in,
-            "time_embed": self.time_embed,
-            "audio_time_embed": self.audio_time_embed,
-            "av_cross_attn_video_scale_shift": self.av_cross_attn_video_scale_shift,
-            "av_cross_attn_video_a2v_gate": self.av_cross_attn_video_a2v_gate,
-            "av_cross_attn_audio_scale_shift": self.av_cross_attn_audio_scale_shift,
-            "av_cross_attn_audio_v2a_gate": self.av_cross_attn_audio_v2a_gate,
-            "caption_projection": self.caption_projection,
-            "audio_caption_projection": self.audio_caption_projection,
-            "norm_out": self.norm_out,
-            "proj_out": self.proj_out,
-            "audio_norm_out": self.audio_norm_out,
-            "audio_proj_out": self.audio_proj_out,
-        }
-        _bad_nonblock: list[dict] = []
-        for _mod_name, _mod in _nonblock_modules.items():
-            for _pname, _pval in _mod.named_parameters():
-                _has_nan = bool(torch.isnan(_pval).any())
-                _has_inf = bool(torch.isinf(_pval).any())
-                if _has_nan or _has_inf:
-                    _bad_nonblock.append(
-                        {
-                            "module": _mod_name,
-                            "param": _pname,
-                            "nan": _has_nan,
-                            "inf": _has_inf,
-                            "inf_count": int(torch.isinf(_pval).sum()),
-                            "numel": _pval.numel(),
-                        }
-                    )
-        # Also check scale_shift_table (nn.Parameter, not a module)
-        for _tbl_name in ("scale_shift_table", "audio_scale_shift_table"):
-            _tbl = getattr(self, _tbl_name, None)
-            if _tbl is not None:
-                _has_nan = bool(torch.isnan(_tbl).any())
-                _has_inf = bool(torch.isinf(_tbl).any())
-                if _has_nan or _has_inf:
-                    _bad_nonblock.append(
-                        {
-                            "module": _tbl_name,
-                            "param": "data",
-                            "nan": _has_nan,
-                            "inf": _has_inf,
-                            "inf_count": int(torch.isinf(_tbl).sum()),
-                            "numel": _tbl.numel(),
-                        }
-                    )
-        log_event(
-            "ltx2_transformer:forward:nonblock_param_scan",
-            f"Non-block param scan (call {_fwd_call_idx}): {len(_bad_nonblock)} bad",
-            data={
-                "fwd_call_idx": _fwd_call_idx,
-                "bad_nonblock": _bad_nonblock,
-                "num_bad": len(_bad_nonblock),
-                "backup_exists": hasattr(self, "_param_cpu_backup"),
-            },
-            hypothesis_id="H22a",
-        )
-        # #endregion
-
         # Restore ALL non-block params from CPU backup via copy_() (zero GPU allocation)
         if hasattr(self, "_nonblock_cpu_backup"):
             _nb_mods = {
@@ -2194,22 +1716,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
         temb = temb.view(batch_size, -1, temb.size(-1))
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
-
-        # #region agent log
-        if _do_nan_trace:
-            log_event(
-                "ltx2_transformer:forward:after_proj_temb",
-                f"proj_in + time_embed done (call {_fwd_call_idx})",
-                data={
-                    "fwd_call_idx": _fwd_call_idx,
-                    "hidden_states": _nc("hidden_states", hidden_states),
-                    "audio_hidden_states": _nc("audio_hs", audio_hidden_states),
-                    "temb": _nc("temb", temb),
-                    "embedded_timestep": _nc("emb_ts", embedded_timestep),
-                },
-                hypothesis_id="H9",
-            )
-        # #endregion
 
         temb_audio, audio_embedded_timestep = self.audio_time_embed(
             audio_timestep.flatten(),
@@ -2291,55 +1797,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     self._nonblock_cpu_backup[_tbl_name] = _tbl.data.cpu()
         _param_cpu_backup = self._param_cpu_backup
 
-        # #region agent log
-        if _do_nan_trace:
-            _bad_params: list[dict] = []
-            for _si, _sb in enumerate(self.transformer_blocks):
-                for _pname, _pval in _sb.named_parameters():
-                    if bool(torch.isinf(_pval).any()) or bool(torch.isnan(_pval).any()):
-                        _bad_params.append(
-                            {
-                                "block": _si,
-                                "param": _pname,
-                                "inf": bool(torch.isinf(_pval).any()),
-                                "nan": bool(torch.isnan(_pval).any()),
-                                "inf_count": int(torch.isinf(_pval).sum()),
-                                "numel": _pval.numel(),
-                            }
-                        )
-            log_event(
-                "ltx2_transformer:forward:weight_scan",
-                f"Scanned all {len(self.transformer_blocks)} blocks (call {_fwd_call_idx})",
-                data={
-                    "fwd_call_idx": _fwd_call_idx,
-                    "total_blocks": len(self.transformer_blocks),
-                    "bad_params": _bad_params,
-                    "num_bad": len(_bad_params),
-                    "backup_present": hasattr(self, "_param_cpu_backup"),
-                    "backup_keys_count": len(getattr(self, "_param_cpu_backup", {})),
-                },
-                hypothesis_id="H22c",
-            )
-            log_event(
-                "ltx2_transformer:forward:before_blocks",
-                "all pre-block tensors ready",
-                data={
-                    "hidden_states": _nc("hidden_states", hidden_states),
-                    "audio_hidden_states": _nc("audio_hs", audio_hidden_states),
-                    "encoder_hidden_states": _nc("enc_hs", encoder_hidden_states),
-                    "audio_encoder_hidden_states": _nc("audio_enc_hs", audio_encoder_hidden_states),
-                    "temb": _nc("temb", temb),
-                    "temb_audio": _nc("temb_audio", temb_audio),
-                    "v_cross_ss": _nc("v_cross_ss", video_cross_attn_scale_shift),
-                    "a_cross_ss": _nc("a_cross_ss", audio_cross_attn_scale_shift),
-                },
-                hypothesis_id="H9",
-            )
-        # #endregion
-
         # 5. Run transformer blocks
-        _nan_found_at_block = -1
-        _corruption_detected = False
         for _block_idx, block in enumerate(self.transformer_blocks):
             hidden_states = hidden_states.clone()
             audio_hidden_states = audio_hidden_states.clone()
@@ -2371,67 +1829,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
             # Restore all block parameters via .to(device) (forces fresh GPU allocation
             # that the XPU caching allocator correctly tracks; copy_() into bulk-allocated
             # offload buffers fails because the allocator loses track of them).
-            _n_restored = 0
             for _pname, _pval in block.named_parameters():
                 _key = f"{_block_idx}.{_pname}"
                 _pval.data = _param_cpu_backup[_key].to(_pval.device)
-                _n_restored += 1
 
-            # #region agent log
-            if _block_idx in (0, 23, 47) and _fwd_call_idx in (0, 1, 4, 9):
-                _hs_nan = bool(torch.isnan(hidden_states).any())
-                _ahs_nan = bool(torch.isnan(audio_hidden_states).any())
-                _rope_sin_ok = float(video_rotary_emb[1].float().abs().max()) <= 1.0 + 1e-3
-                _sample_param = next(block.parameters())
-                log_event(
-                    "ltx2_transformer:copy_health",
-                    f"copy_() health block={_block_idx} call={_fwd_call_idx}",
-                    data={
-                        "fwd_call_idx": _fwd_call_idx,
-                        "block_idx": _block_idx,
-                        "hs_nan": _hs_nan,
-                        "ahs_nan": _ahs_nan,
-                        "rope_sin_absmax": round(float(video_rotary_emb[1].float().abs().max()), 6),
-                        "rope_sin_ok": _rope_sin_ok,
-                        "params_restored": _n_restored,
-                        "hs_absmax": round(float(hidden_states.float().abs().max()), 4),
-                        "ahs_absmax": round(float(audio_hidden_states.float().abs().max()), 4),
-                        "hs_device": str(hidden_states.device),
-                        "ahs_device": str(audio_hidden_states.device),
-                        "param_device": str(_sample_param.device),
-                        "rope_device": str(video_rotary_emb[0].device),
-                        "FIX": "copy_v2",
-                    },
-                    hypothesis_id="H_COPY",
-                )
-            # #endregion
-            _prev_nan_block = getattr(self, "_prev_nan_block", 39)
-            _trace_blocks = {max(_prev_nan_block - 1, 0), _prev_nan_block}
-            # H24: Also trace blocks 1-2 during call 1 to diagnose audio explosion
-            _enable_sub_trace = (_fwd_call_idx == 0 and _block_idx in _trace_blocks) or (
-                _fwd_call_idx == 1 and _block_idx in {1, 2}
-            )
-            if _do_nan_trace and _enable_sub_trace:
-                block._trace_nan = True
-            if _do_nan_trace and _fwd_call_idx == 0 and _block_idx == _prev_nan_block:
-                _v2a_w = block.video_to_audio_attn.to_out[0].weight
-                _v2a_w_inf = bool(torch.isinf(_v2a_w).any())
-                _v2a_w_nan = bool(torch.isnan(_v2a_w).any())
-                log_event(
-                    "ltx2_transformer:forward:v2a_weight_check",
-                    f"V2A to_out weight after restore, block {_block_idx}",
-                    data={
-                        "block_idx": _block_idx,
-                        "device": str(_v2a_w.device),
-                        "weight_inf": _v2a_w_inf,
-                        "weight_nan": _v2a_w_nan,
-                        "weight_absmax": float(_v2a_w.float().abs().max()) if not _v2a_w_inf else "inf",
-                        "restored_from_cpu": True,
-                        "params_restored": _n_restored,
-                    },
-                    hypothesis_id="H20",
-                )
-            # #endregion
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -2471,65 +1872,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     encoder_attention_mask,
                     audio_encoder_attention_mask,
                 )
-
-            # #region agent log
-            if _do_nan_trace and _enable_sub_trace:
-                block._trace_nan = False
-            if _do_nan_trace and _nan_found_at_block < 0:
-                _v_nan = bool(torch.isnan(hidden_states).any())
-                _a_nan = bool(torch.isnan(audio_hidden_states).any())
-                _v_absmax = float(hidden_states.float().abs().max())
-                _a_absmax = float(audio_hidden_states.float().abs().max())
-                _log_this = _block_idx % 5 == 0 or _v_absmax > 1e6 or _a_absmax > 1e6 or _v_nan or _a_nan
-                if _fwd_call_idx == 1 and _block_idx <= 5:
-                    _log_this = True  # log blocks 0-5 for call 1 (audio explosion zone)
-                if _log_this:
-                    log_event(
-                        "ltx2_transformer:forward:block_stats",
-                        f"block {_block_idx} stats (call {_fwd_call_idx})",
-                        data={
-                            "fwd_call_idx": _fwd_call_idx,
-                            "block_idx": _block_idx,
-                            "video_absmax": round(_v_absmax, 2),
-                            "audio_absmax": round(_a_absmax, 2),
-                            "video_nan": _v_nan,
-                            "audio_nan": _a_nan,
-                        },
-                        hypothesis_id="H17",
-                    )
-                if _v_nan or _a_nan:
-                    _nan_found_at_block = _block_idx
-                    self._prev_nan_block = _block_idx
-                    log_event(
-                        "ltx2_transformer:forward:nan_in_block",
-                        f"NaN first appeared in block {_block_idx}",
-                        data={
-                            "block_idx": _block_idx,
-                            "total_blocks": len(self.transformer_blocks),
-                            "video_nan": _v_nan,
-                            "audio_nan": _a_nan,
-                            "hidden_states": _tensor_stats(hidden_states, f"hs_block_{_block_idx}"),
-                            "audio_hidden_states": _tensor_stats(audio_hidden_states, f"audio_hs_block_{_block_idx}"),
-                        },
-                        hypothesis_id="H9",
-                    )
-            # #endregion
-
-        # #region agent log
-        if _do_nan_trace:
-            log_event(
-                "ltx2_transformer:forward:after_all_blocks",
-                f"all blocks done (call {_fwd_call_idx})",
-                data={
-                    "fwd_call_idx": _fwd_call_idx,
-                    "nan_found_at_block": _nan_found_at_block,
-                    "total_blocks": len(self.transformer_blocks),
-                    "hidden_states": _nc("final_hs", hidden_states),
-                    "audio_hidden_states": _nc("final_audio_hs", audio_hidden_states),
-                },
-                hypothesis_id="H9",
-            )
-        # #endregion
 
         # 6. Output layers (including unpatchification)
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]

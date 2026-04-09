@@ -6,15 +6,11 @@ from torch import nn
 from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from vllm.logger import init_logger
 
-# #region agent log
-from vllm_omni.diffusion.debug_mem_logger import log_event
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
 from .module_collector import ModuleDiscovery
-
-# #endregion
 
 logger = init_logger(__name__)
 
@@ -96,29 +92,8 @@ class SequentialOffloadHook(ModelHook):
             return
 
         self._move_params(module, self.device, non_blocking=False)
-        # #region agent log
-        log_event(
-            "sequential_backend.py:_to_gpu:done",
-            "module moved to GPU",
-            data={
-                "module": module.__class__.__name__,
-            },
-            hypothesis_id="OFFLOAD",
-        )
-        # #endregion
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
-        # #region agent log
-        log_event(
-            "sequential_backend.py:pre_forward:before_offload",
-            "offload hook: before CPU/GPU swap",
-            data={
-                "module": module.__class__.__name__,
-                "offload_targets": [t.__class__.__name__ for t in self.offload_targets],
-            },
-            hypothesis_id="OFFLOAD",
-        )
-        # #endregion
         # Offload target modules to CPU
         for target in self.offload_targets:
             self._to_cpu(target)
@@ -126,17 +101,6 @@ class SequentialOffloadHook(ModelHook):
         # Load current module to GPU
         self._to_gpu(module)
         current_omni_platform.synchronize()
-
-        # #region agent log
-        log_event(
-            "sequential_backend.py:pre_forward:after_offload",
-            "offload hook: after CPU/GPU swap",
-            data={
-                "module_on_device": module.__class__.__name__,
-            },
-            hypothesis_id="OFFLOAD",
-        )
-        # #endregion
 
         logger.debug(
             "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
@@ -168,8 +132,7 @@ def apply_sequential_offload(
 
     Example:
         >>> apply_sequential_offload(
-        ...     dit_modules=[pipeline.transformer],
-        ...     encoder_modules=[pipeline.text_encoder, pipeline.vae],
+        ...     all_modules=[pipeline.transformer, pipeline.text_encoder, pipeline.vae],
         ...     device=torch.device("cuda:0"),
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
@@ -221,12 +184,6 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.warning("ModelLevelOffloadBackend already enabled")
             return
 
-        # #region agent log
-        log_event(
-            "sequential_backend.py:enable:start", "ModelLevelOffloadBackend.enable() called", hypothesis_id="OFFLOAD"
-        )
-        # #endregion
-
         modules = ModuleDiscovery.discover(pipeline)
         if not modules.dits:
             logger.warning("No DiT/transformer modules found, skipping model-level offloading")
@@ -247,26 +204,6 @@ class ModelLevelOffloadBackend(OffloadBackend):
         all_modules.extend(modules.vaes)
         all_names.extend(modules.vae_names)
 
-        # #region agent log
-        _all_attrs = [
-            a for a in dir(pipeline) if not a.startswith("_") and isinstance(getattr(pipeline, a, None), nn.Module)
-        ]
-        log_event(
-            "sequential_backend.py:enable:modules_discovered",
-            "modules discovered",
-            data={
-                "dit_names": modules.dit_names,
-                "encoder_names": modules.encoder_names,
-                "auxiliary_names": modules.auxiliary_names,
-                "vae_found": bool(modules.vaes),
-                "all_managed": all_names,
-                "all_module_attrs": _all_attrs,
-                "undiscovered_modules": [a for a in _all_attrs if a not in all_names],
-            },
-            hypothesis_id="OFFLOAD",
-        )
-        # #endregion
-
         # Move ALL modules to CPU so only the active one occupies GPU
         for mod in all_modules:
             try:
@@ -284,17 +221,6 @@ class ModelLevelOffloadBackend(OffloadBackend):
 
         self._offload_modules = all_modules
         self.enabled = True
-
-        # #region agent log
-        log_event(
-            "sequential_backend.py:enable:done",
-            "offload hooks applied, all modules on CPU",
-            data={
-                "all_managed": all_names,
-            },
-            hypothesis_id="OFFLOAD",
-        )
-        # #endregion
 
         logger.info(
             "Model-level offloading enabled: %s (full mutual exclusion)",

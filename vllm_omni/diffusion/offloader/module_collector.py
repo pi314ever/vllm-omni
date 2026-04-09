@@ -17,7 +17,6 @@ class PipelineModules:
     encoder_names: list[str]
     auxiliaries: list[nn.Module]
     auxiliary_names: list[str]
-    # All modules discovered from VAE_ATTRS (e.g. video + audio VAE), in order.
     vaes: list[nn.Module]
     vae_names: list[str]
 

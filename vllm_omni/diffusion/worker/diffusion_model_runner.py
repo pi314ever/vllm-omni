@@ -25,9 +25,6 @@ from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-
-# #region agent log
-from vllm_omni.diffusion.debug_mem_logger import log_event, log_gc_stats
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import supports_step_execution
@@ -38,8 +35,6 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
-
-# #endregion
 
 logger = init_logger(__name__)
 
@@ -189,18 +184,6 @@ class DiffusionModelRunner:
             else:
                 self.cache_backend.enable(self.pipeline)
 
-        # #region agent log
-        log_event(
-            "diffusion_model_runner.py:load_model:init_complete",
-            "model runner init complete",
-            data={
-                "offload_enabled": self.offload_backend is not None,
-                "cache_enabled": self.cache_backend is not None,
-                "enforce_eager": self.od_config.enforce_eager,
-            },
-            hypothesis_id="LOAD",
-        )
-        # #endregion
         logger.info("Model runner: Initialization complete.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -254,20 +237,6 @@ class DiffusionModelRunner:
         if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
-        # #region agent log
-        log_event(
-            "diffusion_model_runner.py:execute_model:entry",
-            "execute_model called",
-            data={
-                "num_prompts": len(req.prompts),
-                "sampling_params_keys": list(vars(req.sampling_params).keys())
-                if hasattr(req.sampling_params, "__dict__")
-                else "N/A",
-            },
-            hypothesis_id="D",
-        )
-        # #endregion
-
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
@@ -307,11 +276,6 @@ class DiffusionModelRunner:
 
             if is_primary:
                 self._record_peak_memory(output)
-            # #region agent log
-            log_event(
-                "diffusion_model_runner.py:execute_model:after_forward", "pipeline.forward returned", hypothesis_id="D"
-            )
-            # #endregion
 
             # NOTE:
             if (
@@ -322,13 +286,6 @@ class DiffusionModelRunner:
             ):
                 cache_summary(self.pipeline, details=True)
 
-            # #region agent log
-            import gc as _gc_runner
-
-            _gc_runner.collect()
-            log_event("diffusion_model_runner.py:execute_model:after_gc", "after gc.collect()", hypothesis_id="D")
-            log_gc_stats("diffusion_model_runner.py:execute_model:after_gc")
-            # #endregion
             return output
 
     # ------------------------------------------------------------------
