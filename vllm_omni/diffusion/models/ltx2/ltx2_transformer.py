@@ -469,14 +469,12 @@ class LTX2AudioVideoAttnProcessor:
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         hidden_states = attn.attn(query, key, value, attn_metadata)
-
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
         hidden_states = attn.to_out[0](hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
-
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
 
