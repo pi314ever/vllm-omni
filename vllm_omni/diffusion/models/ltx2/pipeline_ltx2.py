@@ -815,20 +815,81 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         that bypass forward() hooks."""
         if not getattr(self.od_config, "enable_cpu_offload", False):
             return
+        # #region agent log
+        import time as _time
+
+        _t0 = _time.monotonic()
+        _target_name = target.__class__.__name__
+        log_event(
+            "pipeline_ltx2.py:_swap_for_decode:start",
+            f"swap_for_decode starting for {_target_name}",
+            data={"target": _target_name, "offload": [m.__class__.__name__ for m in offload]},
+            hypothesis_id="H_DECODE_HANG",
+        )
+        # #endregion
         cpu = torch.device("cpu")
         for mod in offload:
             try:
                 if next(mod.parameters()).device != cpu:
+                    # #region agent log
+                    _t_mod = _time.monotonic()
+                    # #endregion
                     self._move_module_params(mod, cpu)
+                    # #region agent log
+                    log_event(
+                        "pipeline_ltx2.py:_swap_for_decode:offloaded",
+                        f"offloaded {mod.__class__.__name__} to CPU",
+                        data={
+                            "module": mod.__class__.__name__,
+                            "elapsed_ms": round((_time.monotonic() - _t_mod) * 1000),
+                        },
+                        hypothesis_id="H_DECODE_HANG",
+                    )
+                    # #endregion
             except StopIteration:
                 pass
+        # #region agent log
+        _t_cache = _time.monotonic()
+        log_event(
+            "pipeline_ltx2.py:_swap_for_decode:before_empty_cache",
+            "about to empty_cache",
+            data={"elapsed_since_start_ms": round((_t_cache - _t0) * 1000)},
+            hypothesis_id="H_DECODE_HANG",
+        )
+        # #endregion
         current_omni_platform.empty_cache()
+        # #region agent log
+        _t_after_cache = _time.monotonic()
+        log_event(
+            "pipeline_ltx2.py:_swap_for_decode:after_empty_cache",
+            "empty_cache done",
+            data={"cache_ms": round((_t_after_cache - _t_cache) * 1000)},
+            hypothesis_id="H_DECODE_HANG",
+        )
+        # #endregion
         try:
             if next(target.parameters()).device != self.device:
                 self._move_module_params(target, self.device)
         except StopIteration:
             pass
+        # #region agent log
+        _t_sync = _time.monotonic()
+        log_event(
+            "pipeline_ltx2.py:_swap_for_decode:before_sync",
+            f"about to synchronize for {_target_name}",
+            data={"load_ms": round((_t_sync - _t_after_cache) * 1000)},
+            hypothesis_id="H_DECODE_HANG",
+        )
+        # #endregion
         current_omni_platform.synchronize()
+        # #region agent log
+        log_event(
+            "pipeline_ltx2.py:_swap_for_decode:done",
+            f"swap_for_decode complete for {_target_name}",
+            data={"target": _target_name, "total_ms": round((_time.monotonic() - _t0) * 1000)},
+            hypothesis_id="H_DECODE_HANG",
+        )
+        # #endregion
 
     def _is_cfg_parallel_enabled(self, do_true_cfg: bool) -> bool:
         return do_true_cfg and get_classifier_free_guidance_world_size() > 1

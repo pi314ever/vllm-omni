@@ -251,6 +251,7 @@ def main():
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
 
+    omni_kwargs["init_timeout"] = 1200
     omni = Omni(**omni_kwargs)
 
     if profiler_enabled:
