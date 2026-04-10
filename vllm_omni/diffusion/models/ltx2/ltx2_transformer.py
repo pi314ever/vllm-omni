@@ -1650,43 +1650,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_coords[:, 0:1, :], device=audio_hidden_states.device
         )
 
-        # NOTE(Daniel): XPU caching allocator corrupts tensors during heavy GPU
-        # memory churn from param restoration.  Keep CPU copies for refresh via
-        # copy_() into pre-allocated GPU buffers (no new GPU allocations).
-        _rope_cpu = (
-            (video_rotary_emb[0].cpu(), video_rotary_emb[1].cpu()),
-            (audio_rotary_emb[0].cpu(), audio_rotary_emb[1].cpu()),
-            (video_cross_attn_rotary_emb[0].cpu(), video_cross_attn_rotary_emb[1].cpu()),
-            (audio_cross_attn_rotary_emb[0].cpu(), audio_cross_attn_rotary_emb[1].cpu()),
-        )
-
-        # Restore ALL non-block params from CPU backup via copy_() (zero GPU allocation)
-        if hasattr(self, "_nonblock_cpu_backup"):
-            _nb_mods = {
-                "proj_in": self.proj_in,
-                "audio_proj_in": self.audio_proj_in,
-                "time_embed": self.time_embed,
-                "audio_time_embed": self.audio_time_embed,
-                "av_cross_attn_video_scale_shift": self.av_cross_attn_video_scale_shift,
-                "av_cross_attn_video_a2v_gate": self.av_cross_attn_video_a2v_gate,
-                "av_cross_attn_audio_scale_shift": self.av_cross_attn_audio_scale_shift,
-                "av_cross_attn_audio_v2a_gate": self.av_cross_attn_audio_v2a_gate,
-                "caption_projection": self.caption_projection,
-                "audio_caption_projection": self.audio_caption_projection,
-                "norm_out": self.norm_out,
-                "proj_out": self.proj_out,
-                "audio_norm_out": self.audio_norm_out,
-                "audio_proj_out": self.audio_proj_out,
-            }
-            for _mn, _mod in _nb_mods.items():
-                for _on, _pv in _mod.named_parameters():
-                    _key = f"{_mn}.{_on}"
-                    if _key in self._nonblock_cpu_backup:
-                        _pv.data.copy_(self._nonblock_cpu_backup[_key], non_blocking=False)
-            for _tn in ("scale_shift_table", "audio_scale_shift_table"):
-                if _tn in self._nonblock_cpu_backup:
-                    getattr(self, _tn).data.copy_(self._nonblock_cpu_backup[_tn], non_blocking=False)
-
         # 2. Patchify input projections
         hidden_states = self.proj_in(hidden_states)
         audio_hidden_states = self.audio_proj_in(audio_hidden_states)
@@ -1753,76 +1716,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
         audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
-        # Save CPU backup of all block parameters ONCE to protect against XPU allocator corruption.
-        # Reuse the same backup across all forward() calls so we never back up corrupted weights.
-        if not hasattr(self, "_param_cpu_backup"):
-            self._param_cpu_backup: dict[str, torch.Tensor] = {}
-            for _si, _sb in enumerate(self.transformer_blocks):
-                for _pname, _pval in _sb.named_parameters():
-                    self._param_cpu_backup[f"{_si}.{_pname}"] = _pval.data.cpu()
-            # Also backup ALL non-block module parameters
-            self._nonblock_cpu_backup: dict[str, torch.Tensor] = {}
-            _nb_modules = {
-                "proj_in": self.proj_in,
-                "audio_proj_in": self.audio_proj_in,
-                "time_embed": self.time_embed,
-                "audio_time_embed": self.audio_time_embed,
-                "av_cross_attn_video_scale_shift": self.av_cross_attn_video_scale_shift,
-                "av_cross_attn_video_a2v_gate": self.av_cross_attn_video_a2v_gate,
-                "av_cross_attn_audio_scale_shift": self.av_cross_attn_audio_scale_shift,
-                "av_cross_attn_audio_v2a_gate": self.av_cross_attn_audio_v2a_gate,
-                "caption_projection": self.caption_projection,
-                "audio_caption_projection": self.audio_caption_projection,
-                "norm_out": self.norm_out,
-                "proj_out": self.proj_out,
-                "audio_norm_out": self.audio_norm_out,
-                "audio_proj_out": self.audio_proj_out,
-            }
-            for _mod_name, _mod in _nb_modules.items():
-                for _pname, _pval in _mod.named_parameters():
-                    self._nonblock_cpu_backup[f"{_mod_name}.{_pname}"] = _pval.data.cpu()
-            for _tbl_name in ("scale_shift_table", "audio_scale_shift_table"):
-                _tbl = getattr(self, _tbl_name, None)
-                if _tbl is not None:
-                    self._nonblock_cpu_backup[_tbl_name] = _tbl.data.cpu()
-        _param_cpu_backup = self._param_cpu_backup
-
         # 5. Run transformer blocks
-        for _block_idx, block in enumerate(self.transformer_blocks):
-            hidden_states = hidden_states.clone()
-            audio_hidden_states = audio_hidden_states.clone()
-            encoder_hidden_states = encoder_hidden_states.clone()
-            audio_encoder_hidden_states = audio_encoder_hidden_states.clone()
-            temb = temb.clone()
-            temb_audio = temb_audio.clone()
-            video_cross_attn_scale_shift = video_cross_attn_scale_shift.clone()
-            audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.clone()
-            video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.clone()
-            audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.clone()
-            if encoder_attention_mask is not None:
-                encoder_attention_mask = encoder_attention_mask.clone()
-            if audio_encoder_attention_mask is not None:
-                audio_encoder_attention_mask = audio_encoder_attention_mask.clone()
-            embedded_timestep = embedded_timestep.clone()
-            audio_embedded_timestep = audio_embedded_timestep.clone()
-
-            # Refresh RoPE tensors from CPU backup via copy_() (zero GPU allocation)
-            video_rotary_emb[0].copy_(_rope_cpu[0][0], non_blocking=False)
-            video_rotary_emb[1].copy_(_rope_cpu[0][1], non_blocking=False)
-            audio_rotary_emb[0].copy_(_rope_cpu[1][0], non_blocking=False)
-            audio_rotary_emb[1].copy_(_rope_cpu[1][1], non_blocking=False)
-            video_cross_attn_rotary_emb[0].copy_(_rope_cpu[2][0], non_blocking=False)
-            video_cross_attn_rotary_emb[1].copy_(_rope_cpu[2][1], non_blocking=False)
-            audio_cross_attn_rotary_emb[0].copy_(_rope_cpu[3][0], non_blocking=False)
-            audio_cross_attn_rotary_emb[1].copy_(_rope_cpu[3][1], non_blocking=False)
-
-            # Restore all block parameters via .to(device) (forces fresh GPU allocation
-            # that the XPU caching allocator correctly tracks; copy_() into bulk-allocated
-            # offload buffers fails because the allocator loses track of them).
-            for _pname, _pval in block.named_parameters():
-                _key = f"{_block_idx}.{_pname}"
-                _pval.data = _param_cpu_backup[_key].to(_pval.device)
-
+        for block in self.transformer_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
                     block,
