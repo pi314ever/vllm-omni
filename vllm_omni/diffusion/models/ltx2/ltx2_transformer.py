@@ -367,9 +367,7 @@ class LTX2AudioVideoAttnProcessor:
             q_size = q_heads * attn.head_dim
             kv_size = kv_heads * attn.head_dim
             query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-            # XPU allocator may reclaim shared storage from split() views;
-            # clone to give each tensor independent storage.
-            return query.clone(), key.clone(), value.clone()
+            return query, key, value
 
         query = attn.to_q(hidden_states)
         if isinstance(query, tuple):
