@@ -1200,11 +1200,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         # Kept inline here to stay aligned with the upstream diffusers connector logic.
         # src/diffusers/pipelines/ltx2/connectors.py
         if self.rope_type == "interleaved":
-            # NOTE(Daniel): Hack for XPU accuracy
-            orig_dtype = freqs.dtype
-            freqs_hp = freqs.double()
-            cos_freqs = freqs_hp.cos().to(orig_dtype).repeat_interleave(2, dim=-1).contiguous()
-            sin_freqs = freqs_hp.sin().to(orig_dtype).repeat_interleave(2, dim=-1).contiguous()
+            cos_freqs = freqs.cos().repeat_interleave(2, dim=-1)
+            sin_freqs = freqs.sin().repeat_interleave(2, dim=-1)
 
             if self.dim % num_rope_elems != 0:
                 cos_padding = torch.ones_like(cos_freqs[:, :, : self.dim % num_rope_elems])
@@ -1216,11 +1213,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             expected_freqs = self.dim // 2
             current_freqs = freqs.shape[-1]
             pad_size = expected_freqs - current_freqs
-            # NOTE(Daniel): Hack for XPU accuracy
-            orig_dtype = freqs.dtype
-            freqs_hp = freqs.double()
-            cos_freq = freqs_hp.cos().to(orig_dtype)
-            sin_freq = freqs_hp.sin().to(orig_dtype)
+            cos_freq = freqs.cos()
+            sin_freq = freqs.sin()
 
             if pad_size != 0:
                 cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
@@ -1236,8 +1230,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             cos_freq = cos_freq.reshape(b, t, self.num_attention_heads, -1)
             sin_freq = sin_freq.reshape(b, t, self.num_attention_heads, -1)
 
-            cos_freqs = torch.swapaxes(cos_freq, 1, 2).contiguous()  # (B,H,T,D//2)
-            sin_freqs = torch.swapaxes(sin_freq, 1, 2).contiguous()  # (B,H,T,D//2)
+            cos_freqs = torch.swapaxes(cos_freq, 1, 2)  # (B,H,T,D//2)
+            sin_freqs = torch.swapaxes(sin_freq, 1, 2)  # (B,H,T,D//2)
 
         return cos_freqs, sin_freqs
 
