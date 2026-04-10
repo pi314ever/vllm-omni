@@ -188,8 +188,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 torch_dtype=dtype,
                 local_files_only=local_files_only,
             )
-            if not cpu_offload:
-                self.text_encoder = self.text_encoder.to(self.device)
         self.connectors = LTX2TextConnectors.from_pretrained(
             model,
             subfolder="connectors",
