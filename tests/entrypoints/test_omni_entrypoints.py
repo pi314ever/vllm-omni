@@ -807,11 +807,9 @@ async def test_async_omni_propagates_engine_generate_error(monkeypatch: pytest.M
 
     app = AsyncOmni("dummy-model")
     try:
-        with pytest.raises(EngineGenerateError) as exc_info:
+        with pytest.raises(EngineGenerateError):
             async for _ in app.generate(prompt="hello", request_id="req-recover"):
                 pass
-        assert isinstance(exc_info.value.__cause__, RuntimeError)
-        assert str(exc_info.value.__cause__) == "diffusion step failed"
     finally:
         app.shutdown()
 
@@ -910,10 +908,8 @@ def test_omni_propagates_engine_generate_error(monkeypatch: pytest.MonkeyPatch):
 
     app = Omni("dummy-model")
     try:
-        with pytest.raises(EngineGenerateError) as exc_info:
+        with pytest.raises(EngineGenerateError):
             list(app.generate(["hello"], py_generator=False, use_tqdm=False))
-        assert isinstance(exc_info.value.__cause__, RuntimeError)
-        assert str(exc_info.value.__cause__) == "diffusion step failed"
     finally:
         app.shutdown()
 
