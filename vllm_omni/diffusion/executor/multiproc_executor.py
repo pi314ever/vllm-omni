@@ -42,10 +42,14 @@ class BackgroundResources:
 
     def __call__(self):
         """Clean up background resources."""
+        if hasattr(self, "wake_events") and self.wake_events:
+            for ev in self.wake_events:
+                ev.set()
+
         if self.broadcast_mq is not None:
             try:
                 for _ in range(self.num_workers):
-                    self.broadcast_mq.enqueue(SHUTDOWN_MESSAGE)
+                    self.broadcast_mq.enqueue(SHUTDOWN_MESSAGE, timeout=1.0)
 
                 self.broadcast_mq = None
                 self.result_mq = None
@@ -73,11 +77,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._failure_callbacks: list[Callable[[], None]] = []
 
         num_workers = self.od_config.num_gpus
+        self.wake_events = [mp.Event() for _ in range(num_workers)]
+
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
 
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle)
+        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
         self._result_mq = self._init_result_queue(result_handle)
         self._processes = processes
 
@@ -127,7 +133,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     raise EngineDeadError()
                 continue
 
-    def _launch_workers(self, broadcast_handle):
+    def _launch_workers(self, broadcast_handle, wake_events):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -153,6 +159,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
