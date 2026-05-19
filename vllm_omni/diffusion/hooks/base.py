@@ -136,6 +136,22 @@ class _WrappedForward:
         return registry.dispatch(*args, **kwargs)
 
 
+@dataclass
+class _WrappedMethod:
+    """Wrapper that intercepts arbitrary method calls and runs hook pre_forward
+    to trigger device swaps before the original method executes."""
+
+    module: nn.Module
+    original_method: Callable
+
+    def __call__(self, *args: Any, **kwargs: Any):
+        registry: HookRegistry | None = getattr(self.module, "_hook_registry", None)
+        if registry is not None and registry._hooks:
+            for _, hook in sorted(registry._hooks.items(), key=lambda x: x[0]):
+                args, kwargs = hook.pre_forward(self.module, *args, **kwargs)
+        return self.original_method(*args, **kwargs)
+
+
 class HookRegistry:
     """Registry of hooks attached to a module.
 
@@ -146,6 +162,7 @@ class HookRegistry:
     def __init__(self, module: nn.Module):
         self.module = module
         self._hooks: dict[str, ModelHook] = {}
+        self._wrapped_methods: list[str] = []
 
     @classmethod
     def get_or_create(cls, module: nn.Module) -> HookRegistry:
@@ -250,3 +267,34 @@ class HookRegistry:
         hook = self._hooks.get(name)
         if hook is not None:
             hook.reset_state(self.module)
+
+    def wrap_method(self, method_name: str) -> None:
+        """Also intercept calls to the named method (e.g. 'decode', 'encode').
+
+        The wrapper calls all registered hooks' pre_forward() before delegating
+        to the original method. This is used to trigger CPU-offload device swaps
+        for methods like vae.decode() that bypass module.forward().
+        """
+        original_attr = f"_omni_original_{method_name}"
+        if hasattr(self.module, original_attr):
+            return  # already wrapped
+        original = getattr(self.module, method_name)
+        setattr(self.module, original_attr, original)
+        wrapped = _WrappedMethod(module=self.module, original_method=original)
+        wrapped.__signature__ = inspect.signature(original)  # type: ignore[attr-defined]
+        setattr(self.module, method_name, wrapped)
+        self._wrapped_methods.append(method_name)
+
+    def unwrap_method(self, method_name: str) -> None:
+        """Restore the original method, removing the hook wrapper."""
+        original_attr = f"_omni_original_{method_name}"
+        if hasattr(self.module, original_attr):
+            setattr(self.module, method_name, getattr(self.module, original_attr))
+            delattr(self.module, original_attr)
+            if method_name in self._wrapped_methods:
+                self._wrapped_methods.remove(method_name)
+
+    def unwrap_all_methods(self) -> None:
+        """Restore all wrapped methods to their originals."""
+        for method_name in list(self._wrapped_methods):
+            self.unwrap_method(method_name)
