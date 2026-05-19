@@ -122,6 +122,18 @@ async def async_request_chat_completions(
                                     output.peak_memory_mb = first_item.get("peak_memory_mb", 0.0)
                 except (IndexError, TypeError, AttributeError):
                     pass
+
+                if (not output.stage_durations or output.peak_memory_mb == 0.0) and isinstance(
+                    resp_json.get("metrics"), dict
+                ):
+                    m = resp_json["metrics"]
+                    if not output.stage_durations and isinstance(m.get("stage_durations"), dict):
+                        output.stage_durations = m.get("stage_durations") or {}
+                    if output.peak_memory_mb == 0.0 and m.get("peak_memory_mb") is not None:
+                        try:
+                            output.peak_memory_mb = float(m.get("peak_memory_mb") or 0.0)
+                        except (TypeError, ValueError):
+                            pass
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
@@ -139,7 +151,7 @@ async def async_request_chat_completions(
     return output
 
 
-async def async_request_openai_images(
+async def async_request_openai_image_generations(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
@@ -306,6 +318,8 @@ async def async_request_v1_videos(
             video_bytes = await content_response.read()
             output.response_body = video_bytes
             output.success = True
+            if "stage_durations" in poll_json:
+                output.stage_durations = poll_json["stage_durations"] or {}
             if "peak_memory_mb" in poll_json:
                 output.peak_memory_mb = poll_json["peak_memory_mb"]
             elif "peak_memory_mb" in resp_json:
@@ -334,12 +348,38 @@ async def async_request_v1_videos(
     return output
 
 
+LEGACY_BACKEND_ENDPOINT_ALIASES = {
+    "vllm-omni": "/v1/chat/completions",
+    "openai": "/v1/images/generations",
+}
+
+
+def normalize_endpoint(value: str) -> str:
+    endpoint = str(value).strip()
+    if not endpoint:
+        raise ValueError("endpoint must not be empty.")
+    endpoint = LEGACY_BACKEND_ENDPOINT_ALIASES.get(
+        endpoint,
+        LEGACY_BACKEND_ENDPOINT_ALIASES.get(endpoint.lstrip("/"), endpoint),
+    )
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    return endpoint
+
+
+def endpoint_filename_token(value: str) -> str:
+    token = normalize_endpoint(value).lstrip("/")
+    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
+        token = token.replace(bad, "_")
+    return token or "endpoint"
+
+
 backends_function_mapping = {
     "2i": {
-        "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
-        "openai": (async_request_openai_images, "/v1/images/generations"),
+        "/v1/chat/completions": (async_request_chat_completions, "/v1/chat/completions"),
+        "/v1/images/generations": (async_request_openai_image_generations, "/v1/images/generations"),
     },
     "2v": {
-        "v1/videos": (async_request_v1_videos, "/v1/videos"),
+        "/v1/videos": (async_request_v1_videos, "/v1/videos"),
     },
 }

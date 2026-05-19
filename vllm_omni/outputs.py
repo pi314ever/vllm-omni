@@ -9,6 +9,33 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 
+@dataclass
+class OmniConnectorOutput:
+    """Communication results from Model Runner to Scheduler.
+
+    Carries transfer readiness signals so the Scheduler can make scheduling
+    decisions without ever calling connector.put()/get() directly.
+
+    Attributes:
+        chunk_ready_req_ids: Request IDs with newly arrived chunks this cycle.
+        chunk_finished_req_ids: Request IDs whose final chunk has arrived.
+        request_metadata: Lightweight scheduling metadata keyed by request ID
+            (e.g. next_stage_prompt_len, code_predictor_codes, left_context_size).
+            Full payloads are owned by the Model Runner's local cache.
+        kv_sent_req_ids: Request IDs whose KV cache was successfully sent.
+        stage_recv_req_ids: Request IDs that received batch stage inputs.
+        has_pending_kv_work: True if the mixin has pending, active, or
+            completed KV transfers that the scheduler should account for.
+    """
+
+    chunk_ready_req_ids: set[str] = field(default_factory=set)
+    chunk_finished_req_ids: set[str] = field(default_factory=set)
+    request_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    kv_sent_req_ids: list[str] = field(default_factory=list)
+    stage_recv_req_ids: set[str] = field(default_factory=set)
+    has_pending_kv_work: bool = False
+
+
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 
@@ -24,6 +51,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
+    omni_connector_output: OmniConnectorOutput | None = None
 
 
 @dataclass
@@ -71,6 +99,30 @@ class OmniRequestOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # error handling
+    error: str | None = None
+
+    @classmethod
+    def from_error(
+        cls,
+        request_id: str,
+        error_message: str,
+    ) -> "OmniRequestOutput":
+        """Create a terminal error output.
+
+        Args:
+            request_id: Request identifier
+            error_message: Human-readable error description
+
+        Returns:
+            OmniRequestOutput with ``finished=True`` and the ``error`` field set.
+        """
+        return cls(
+            request_id=request_id,
+            finished=True,
+            error=error_message,
+        )
 
     @classmethod
     def from_pipeline(
@@ -254,6 +306,72 @@ class OmniRequestOutput:
     def is_pipeline_output(self) -> bool:
         """Check if this is a pipeline stage output."""
         return self.stage_id is not None and self.request_output is not None
+
+    def unwrap(self) -> "OmniRequestOutput":
+        """Unwrap nested OmniRequestOutput to get the innermost result.
+
+        This helper handles the common pattern where pipeline outputs may wrap
+        other OmniRequestOutput instances. It recursively unwraps until it reaches
+        the final output with actual content (images, text, etc.).
+
+        Returns:
+            The innermost OmniRequestOutput containing the actual generation results.
+
+        Example:
+            ```python
+            result = omni.generate(...)
+            output = OmniRequestOutput.unwrap_result(result)
+            if output.images:
+                # Access images directly
+                video_frames = output.images
+            ```
+        """
+        current = self
+        # Unwrap nested pipeline outputs
+        while current.is_pipeline_output and current.request_output is not None:
+            if isinstance(current.request_output, OmniRequestOutput):
+                current = current.request_output
+            else:
+                break
+        return current
+
+    @staticmethod
+    def unwrap_result(result: Any) -> "OmniRequestOutput":
+        """Unwrap result from omni.generate() to get the final OmniRequestOutput.
+
+        This static helper handles the full unwrapping pattern including:
+        1. Extracting from list if needed
+        2. Type validation
+        3. Recursive unwrapping of nested pipeline outputs
+
+        Args:
+            result: The result from omni.generate() - may be a list or OmniRequestOutput
+
+        Returns:
+            The innermost OmniRequestOutput with actual content
+
+        Raises:
+            ValueError: If result is not an OmniRequestOutput or list containing one
+
+        Example:
+            ```python
+            result = omni.generate(...)
+            output = OmniRequestOutput.unwrap_result(result)
+            # output is guaranteed to be the final OmniRequestOutput
+            ```
+        """
+        # Handle list wrapper
+        if isinstance(result, list):
+            if not result:
+                raise ValueError("Result list is empty")
+            result = result[0]
+
+        # Validate type
+        if not isinstance(result, OmniRequestOutput):
+            raise ValueError(f"Expected OmniRequestOutput, got {type(result)}")
+
+        # Unwrap nested outputs
+        return result.unwrap()
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""

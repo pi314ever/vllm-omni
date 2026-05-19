@@ -7,7 +7,6 @@
 # Original file was released under Apache-2.0, with the full license text
 # available at https://github.com/huggingface/transformers/blob/main/LICENSE.
 
-import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -49,6 +48,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 
 def patchify(imgs, p):
@@ -114,17 +114,32 @@ class BagelRotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        if config.rope_scaling is not None:
-            # Delegate to HF's rope-scaling helpers for non-default types.
+        # transformers>=5.0 stores rope params under ``rope_parameters`` and
+        # always populates ``rope_scaling`` (even for the default type), so we
+        # infer ``rope_type`` from either and fall back to "default".
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_type = (
+            rope_scaling.get("rope_type") or rope_scaling.get("type") or rope_parameters.get("rope_type") or "default"
+        )
+
+        if rope_type == "default":
+            # transformers>=5.0 removed the 'default' entry from
+            # ROPE_INIT_FUNCTIONS; use the plain sinusoidal formula.
+            rope_theta = (
+                getattr(config, "rope_theta", None)
+                or rope_parameters.get("rope_theta")
+                or rope_scaling.get("rope_theta")
+                or 10000.0
+            )
+            dim = config.hidden_size // config.num_attention_heads
+            inv_freq = 1.0 / (rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            self.attention_scaling = 1.0
+        else:
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-            rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
             rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
             inv_freq, self.attention_scaling = rope_init_fn(config, device=None)
-        else:
-            dim = config.hidden_size // config.num_attention_heads
-            inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-            self.attention_scaling = 1.0
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -738,6 +753,14 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
 
 class Qwen2MoTModel(Qwen2PreTrainedModel):
+    _layerwise_offload_blocks_attrs = ["layers"]
+
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return "layers" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     def __init__(
         self,
         config,
@@ -775,10 +798,10 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
 
     def forward(
         self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
+        packed_query_sequence: torch.Tensor | None = None,
+        query_lens: torch.Tensor | None = None,
+        packed_query_position_ids: torch.Tensor | None = None,
+        packed_query_indexes: torch.Tensor | None = None,
         past_key_values: NaiveCache | None = None,
         key_values_lens: torch.Tensor | None = None,
         packed_key_value_indexes: torch.Tensor | None = None,
@@ -787,7 +810,20 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        packed_text_ids: torch.Tensor | None = None,
+        return_embeddings_only: bool = False,
     ) -> BaseNavitOutputWithPast:
+        if packed_query_sequence is None:
+            if packed_text_ids is None:
+                raise ValueError("Either packed_query_sequence or packed_text_ids must be provided.")
+            packed_query_sequence = self.embed_tokens(packed_text_ids)
+
+        if return_embeddings_only:
+            return BaseNavitOutputWithPast(
+                packed_query_sequence=packed_query_sequence,
+                past_key_values=past_key_values,
+            )
+
         # create position embeddings to be shared across the decoder layers
         cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         cos = cos.squeeze(0)
@@ -854,6 +890,7 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
             config, parallel_config=parallel_config, quant_config=quant_config, prefix=f"{prefix}.model"
         )
         self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -864,6 +901,12 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
     def set_decoder(self, decoder):
         self.model = decoder
 
@@ -872,10 +915,10 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
 
     def forward(
         self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
+        packed_query_sequence: torch.Tensor | None = None,
+        query_lens: torch.Tensor | None = None,
+        packed_query_position_ids: torch.Tensor | None = None,
+        packed_query_indexes: torch.Tensor | None = None,
         past_key_values: NaiveCache | None = None,
         key_values_lens: torch.Tensor | None = None,
         packed_key_value_indexes: torch.Tensor | None = None,
@@ -884,6 +927,8 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        packed_text_ids: torch.Tensor | None = None,
+        return_embeddings_only: bool = False,
     ) -> BaseNavitOutputWithPast:
         outputs = self.model(
             packed_query_sequence=packed_query_sequence,
@@ -898,6 +943,8 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
             mode=mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=return_embeddings_only,
         )
 
         return outputs
@@ -1017,28 +1064,8 @@ class TimestepEmbedder(nn.Module):
         )
         self.frequency_embedding_size = frequency_embedding_size
 
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        half = dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
-            device=t.device
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -1207,7 +1234,7 @@ class Bagel(nn.Module):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
-            text_ids = tokenizer.encode(prompt)
+            text_ids = tokenizer.encode(prompt, add_special_tokens=False)
             text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
             text_token_lens.append(len(text_ids))
             packed_text_ids.extend(text_ids)
@@ -1238,14 +1265,12 @@ class Bagel(nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-
         extra_inputs = {}
         if self.use_moe:
             extra_inputs = {"mode": "und"}
 
         output = self.language_model.forward(
-            packed_query_sequence=packed_text_embedding,
+            packed_text_ids=packed_text_ids,
             query_lens=text_token_lens,
             packed_query_position_ids=packed_text_position_ids,
             packed_query_indexes=packed_text_indexes,
@@ -1351,10 +1376,6 @@ class Bagel(nn.Module):
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
-        packed_sequence[packed_text_indexes] = packed_text_embedding
-
         padded_latent = vae_model.encode(padded_images)
 
         p = self.latent_patch_size
@@ -1367,9 +1388,6 @@ class Bagel(nn.Module):
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(packed_timesteps)
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
-        if packed_latent.dtype != packed_sequence.dtype:
-            packed_latent = packed_latent.to(packed_sequence.dtype)
-        packed_sequence[packed_vae_token_indexes] = packed_latent
 
         extra_inputs = {}
         if self.use_moe:
@@ -1380,7 +1398,7 @@ class Bagel(nn.Module):
             }
 
         output = self.language_model.forward(
-            packed_query_sequence=packed_sequence,
+            packed_text_ids=packed_text_ids,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
             packed_query_indexes=packed_indexes,
@@ -1473,7 +1491,10 @@ class Bagel(nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
@@ -1619,9 +1640,108 @@ class Bagel(nn.Module):
         num_layers = len(caches[0].key_cache)
         merged = NaiveCache(num_layers)
         for layer_idx in range(num_layers):
-            merged.key_cache[layer_idx] = torch.cat([c.key_cache[layer_idx] for c in caches], dim=0)
-            merged.value_cache[layer_idx] = torch.cat([c.value_cache[layer_idx] for c in caches], dim=0)
+            key_parts = [c.key_cache[layer_idx] for c in caches if c.key_cache[layer_idx] is not None]
+            val_parts = [c.value_cache[layer_idx] for c in caches if c.value_cache[layer_idx] is not None]
+            merged.key_cache[layer_idx] = torch.cat(key_parts, dim=0) if key_parts else None
+            merged.value_cache[layer_idx] = torch.cat(val_parts, dim=0) if val_parts else None
         return merged
+
+    def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
+        """Prepare start tokens for autoregressive text generation.
+
+        Ported from the original BAGEL ``Bagel.prepare_start_tokens``.
+        """
+        packed_start_tokens, packed_key_value_indexes = list(), list()
+        packed_query_position_ids = list()
+
+        curr = 0
+        for curr_kvlen, curr_position_id in zip(curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            packed_start_tokens.append(new_token_ids["bos_token_id"])
+            packed_query_position_ids.append(curr_position_id)
+            curr += curr_kvlen
+
+        generation_input = {
+            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
+            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+        }
+        return generation_input
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        key_values_lens: torch.IntTensor,
+        packed_start_tokens: torch.LongTensor,
+        packed_query_position_ids: torch.LongTensor,
+        max_length: int,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        end_token_id: int | None = None,
+    ):
+        """Autoregressive text generation (ported from original BAGEL).
+
+        Decodes tokens one at a time, appending to ``past_key_values``
+        until ``max_length`` is reached or ``end_token_id`` is generated.
+        """
+        step = 0
+        generated_sequence = []
+        curr_tokens = packed_start_tokens
+        while step < max_length:
+            generated_sequence.append(curr_tokens)
+            query_lens = torch.ones_like(curr_tokens)
+            packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
+                0,
+                len(key_values_lens),
+                device=key_values_lens.device,
+                dtype=key_values_lens.dtype,
+            )
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] += i
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+
+            output = self.language_model(
+                packed_text_ids=curr_tokens,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=True,
+                is_causal=True,
+                mode="und",
+            )
+            past_key_values = output.past_key_values
+            packed_query_sequence = output.packed_query_sequence
+            pred_logits = self.language_model.lm_head(packed_query_sequence)
+
+            if do_sample:
+                probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
+                curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                curr_tokens = torch.argmax(pred_logits, dim=-1)
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = torch.cat(
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
+                )
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + 1
+            step += 1
+
+            if end_token_id is not None and curr_tokens[0] == end_token_id:
+                break
+
+        output_device = generated_sequence[0].device
+        return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
 
     def generate_image(
         self,
@@ -1718,6 +1838,8 @@ class Bagel(nn.Module):
         # ── SP + CFG: sequential single-branch forwards ──
         use_sp = self._sp_size > 1
         if use_sp and use_cfg_text:
+            if return_trajectory_latents and len(timesteps) > 0:
+                trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 in_cfg_window = t > cfg_interval[0] and t <= cfg_interval[1]
@@ -1781,13 +1903,15 @@ class Bagel(nn.Module):
                     x_t = x_t - v_t.to(x_t.device) * dts[i]
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i] - dts[i])
+                    trajectory_timesteps.append(timesteps[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── SP without CFG: direct single-branch loop ──
         if use_sp:
+            if return_trajectory_latents and len(timesteps) > 0:
+                trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 v_t = self.forward_single_branch(
@@ -1814,7 +1938,7 @@ class Bagel(nn.Module):
                     x_t = x_t - v_t.to(x_t.device) * dts[i]
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i] - dts[i])
+                    trajectory_timesteps.append(timesteps[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
@@ -1875,6 +1999,9 @@ class Bagel(nn.Module):
                 "merged_cache": self._merge_naive_caches(branches_cache),
             }
 
+        if return_trajectory_latents and len(timesteps) > 0:
+            trajectory_latents.append(x_t.clone())
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
@@ -1912,7 +2039,7 @@ class Bagel(nn.Module):
                 x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
-                trajectory_timesteps.append(timesteps[i] - dts[i])
+                trajectory_timesteps.append(timesteps[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
@@ -2013,6 +2140,9 @@ class Bagel(nn.Module):
         )
         _sched_kw = scheduler_kwargs or {}
 
+        if return_trajectory_latents and len(timesteps) > 0:
+            trajectory_latents.append(x_t.clone())
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
@@ -2070,7 +2200,7 @@ class Bagel(nn.Module):
                 x_t = x_t - v_t.to(x_t.device) * dts[i]
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
-                trajectory_timesteps.append(timesteps[i] - dts[i])
+                trajectory_timesteps.append(timesteps[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
@@ -2169,7 +2299,10 @@ class Bagel(nn.Module):
                 packed_position_ids,
             )
 
-            packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+            packed_text_embedding = self.language_model.forward(
+                packed_text_ids=packed_text_ids,
+                return_embeddings_only=True,
+            ).packed_query_sequence
             packed_sequence = packed_text_embedding.new_zeros((int(local_seqlens.sum()), self.hidden_size))
             packed_sequence[local_text_indexes] = packed_text_embedding
 
@@ -2224,7 +2357,10 @@ class Bagel(nn.Module):
             return self._gather_vae_for_sp(local_v_t)
 
         # Original non-SP path
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
@@ -2279,7 +2415,10 @@ class Bagel(nn.Module):
         cfg_batched: dict | None = None,
     ):
         # Build query sequence (identical for all CFG branches)
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 

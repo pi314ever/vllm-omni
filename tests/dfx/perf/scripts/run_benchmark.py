@@ -1,32 +1,56 @@
 import json
 import os
-import subprocess
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer
 from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
     create_unique_server_params,
     get_benchmark_params_for_server,
     load_configs,
+    run_benchmark,
 )
+from tests.helpers.runtime import OmniServer
+
+pytestmark = [pytest.mark.full_model]
+
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
-CONFIG_FILE_PATH = str(Path(__file__).parent.parent / "tests" / "test.json")
+def _get_config_file_from_argv() -> str | None:
+    """Read ``--test-config-file`` from ``sys.argv`` at import time so parametrization can use it."""
+    import sys
+
+    for i, arg in enumerate(sys.argv):
+        if arg == "--test-config-file" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith("--test-config-file="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+_PERF_TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
+_DEFAULT_CONFIG_FILE = str(_PERF_TESTS_DIR / "test_qwen_omni.json")
+
+CONFIG_FILE_PATH = _get_config_file_from_argv()
+if CONFIG_FILE_PATH is None:
+    print(
+        "No --test-config-file in argv, using default: tests/dfx/perf/tests/test_qwen_omni.json "
+        "(override with e.g. --test-config-file tests/dfx/perf/tests/test_tts.json)"
+    )
+    CONFIG_FILE_PATH = _DEFAULT_CONFIG_FILE
+
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
+OMNI_RESULT_TEMPLATE_PATH = Path(__file__).parent / "result_omni_template.json"
 
 
-STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
-test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR)
+DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
+test_params = create_unique_server_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 
 _omni_server_lock = threading.Lock()
@@ -39,14 +63,22 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path = request.param
+        test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "120"]
+        server_args: list[str] = []
+        if use_omni:
+            server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
+        # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
+        # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
         if stage_config_path:
-            server_args = ["--stage-configs-path", stage_config_path] + server_args
-        with OmniServer(model, server_args) as server:
+            server_args = ["--deploy-config", stage_config_path] + server_args
+        if stage_overrides:
+            server_args = ["--stage-overrides", stage_overrides] + server_args
+        if extra_cli_args:
+            server_args = list(extra_cli_args) + server_args
+        with OmniServer(model, server_args, use_omni=use_omni) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server
@@ -55,48 +87,14 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
-def run_benchmark(
-    args: list,
-    test_name: str,
-    flow,
-    dataset_name: str,
-    num_prompt,
-) -> Any:
-    """Run a single benchmark iteration and return the parsed result JSON."""
-    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
-    if "--result-filename" in args:
-        print(f"The result file will be overwritten by {result_filename}")
-    command = (
-        ["vllm", "bench", "serve", "--omni"]
-        + args
-        + [
-            "--save-result",
-            "--result-dir",
-            os.environ.get("BENCHMARK_DIR", "tests"),
-            "--result-filename",
-            result_filename,
-        ]
-    )
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True
-    )
-
-    for line in iter(process.stdout.readline, ""):
-        print(line, end=" ")
-
-    for line in iter(process.stderr.readline, ""):
-        print(line, end=" ")
-
-    if "--result-dir" in command:
-        index = command.index("--result-dir")
-        result_dir = command[index + 1]
-    else:
-        result_dir = "./"
-
-    with open(os.path.join(result_dir, result_filename), encoding="utf-8") as f:
-        result = json.load(f)
-    return result
+def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
+    """Make a single path segment safe for result filenames on common filesystems."""
+    if value is None:
+        return default
+    s = str(value).strip()
+    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
+        s = s.replace(bad, "_")
+    return s if s else default
 
 
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
@@ -165,6 +163,25 @@ def _resolve_baseline_value(
     return baseline_raw
 
 
+def _baseline_thresholds_for_step(
+    baseline_data: dict[str, Any],
+    *,
+    sweep_index: int | None = None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+) -> dict[str, Any]:
+    """Resolve ``test.json`` ``baseline`` block to one threshold per metric (same as ``assert_result``)."""
+    return {
+        metric_name: _resolve_baseline_value(
+            baseline_raw,
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+        )
+        for metric_name, baseline_raw in baseline_data.items()
+    }
+
+
 def assert_result(
     result,
     params,
@@ -194,6 +211,7 @@ def assert_result(
                 print(f"ERROR: Test results exceeded baseline: {metric_name}: {current_value} < {baseline_value}")
 
 
+@pytest.mark.benchmark
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
 def test_performance_benchmark(omni_server, benchmark_params):
@@ -230,7 +248,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
     args = ["--host", host, "--port", str(port)]
-    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency"}
+    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency", "task", "enabled", "eval_phase"}
 
     for key, value in params.items():
         if key in exclude_keys or value is None:
@@ -255,6 +273,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=qps,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=qps,
+            max_concurrency=None,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,
@@ -273,6 +297,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=concurrency,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=None,
+            max_concurrency=concurrency,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,

@@ -5,6 +5,7 @@
 
 import json
 import sys
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,19 @@ logger = get_connector_logger(__name__)
 # Reserve a separate port range for KV-transfer sockets so they do not
 # collide with request-forwarding endpoints that share the same base port.
 KV_TRANSFER_PORT_OFFSET = 100
+
+# Port stride between TP ranks so each worker binds a unique ZMQ port
+# when TP > 1.  Must be larger than the maximum number of pipeline stages.
+# Formula:
+#   zmq_port = base + KV_TRANSFER_PORT_OFFSET
+#            + replica * KV_REPLICA_PORT_STRIDE
+#            + rank * KV_RANK_PORT_STRIDE
+#            + stage
+KV_RANK_PORT_STRIDE = 16
+
+# Port stride between Omni replicas of the same stage.  This reserves a
+# comfortably sized block per replica for TP-rank and stage offsets.
+KV_REPLICA_PORT_STRIDE = 1024
 
 
 def initialize_connectors_from_config(
@@ -200,6 +214,19 @@ def load_omni_transfer_config(
 
     if config_dict is None:
         return None
+
+    # Normalize new-schema (top-level ``connectors`` + ``stages``) into the
+    # legacy ``runtime.connectors`` + ``stage_args`` shape the parser reads.
+    if "stages" in config_dict and "stage_args" not in config_dict:
+        normalized: dict[str, Any] = dict(config_dict)
+        runtime = dict(normalized.get("runtime") or {})
+        if "connectors" in normalized and "connectors" not in runtime:
+            runtime["connectors"] = normalized["connectors"]
+        if "edges" in normalized and "edges" not in runtime:
+            runtime["edges"] = normalized["edges"]
+        normalized["runtime"] = runtime
+        normalized["stage_args"] = normalized["stages"]
+        config_dict = normalized
 
     # Parse connectors
     connectors = {}
@@ -385,7 +412,16 @@ def build_stage_connectors(
     connectors_config: dict[str, Any],
     purpose: str = "request_forwarding",
 ) -> dict[tuple[str, str], Any] | None:
-    """Instantiate OmniConnectors for a stage based on config."""
+    """Instantiate OmniConnectors for a stage based on config.
+
+    Deprecated: prefer ``get_stage_connector_config`` plus the unified
+    connector factory. Kept as a thin shim so legacy callers keep working.
+    """
+    warnings.warn(
+        "build_stage_connectors is deprecated; use get_stage_connector_config and OmniConnectorFactory instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not connectors_config:
         return {}
 

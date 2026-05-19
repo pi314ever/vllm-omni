@@ -76,10 +76,14 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
+        # XPU's allocator doesn't respect stream dependencies in empty_cache,
+        # so non-blocking copies can race with cache eviction. Use blocking
+        # copies on XPU to avoid NULL pointer errors during DMA.
+        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
         self._move_params(
             module,
             torch.device("cpu"),
-            non_blocking=not self.use_hsdp,
+            non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
         current_omni_platform.empty_cache()
@@ -113,15 +117,11 @@ class SequentialOffloadHook(ModelHook):
         return args, kwargs
 
 
-_HOOKABLE_VAE_METHODS = ("decode", "encode")
-
-
 def apply_sequential_offload(
     all_modules: list[nn.Module],
     device: torch.device,
     pin_memory: bool = True,
     use_hsdp: bool = False,
-    vae_modules: list[nn.Module] | None = None,
 ) -> None:
     """Apply sequential offloading hooks with full mutual exclusion.
 
@@ -133,8 +133,6 @@ def apply_sequential_offload(
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
         use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
-        vae_modules: VAE modules whose decode/encode methods should also
-            be wrapped so that offload hooks fire for those calls
 
     Example:
         >>> apply_sequential_offload(
@@ -157,18 +155,6 @@ def apply_sequential_offload(
             "Registered offload hook for %s (targets: %d others)", module.__class__.__name__, len(offload_targets)
         )
 
-    # Wrap decode/encode on VAE modules so offload hooks fire
-    for vae_mod in vae_modules or []:
-        registry = HookRegistry.get_or_create(vae_mod)
-        for method_name in _HOOKABLE_VAE_METHODS:
-            if hasattr(vae_mod, method_name):
-                registry.wrap_method(method_name)
-                logger.debug(
-                    "Wrapped %s.%s for offload hook dispatch",
-                    vae_mod.__class__.__name__,
-                    method_name,
-                )
-
 
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
     """Remove sequential offloading hooks from modules.
@@ -184,7 +170,6 @@ def remove_sequential_offload(modules: list[nn.Module]) -> None:
         registry: HookRegistry | None = getattr(module, "_hook_registry", None)
         if registry is not None:
             registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
-            registry.unwrap_all_methods()
             logger.debug("Removed offload hook from %s", module.__class__.__name__)
 
 
@@ -231,20 +216,27 @@ class ModelLevelOffloadBackend(OffloadBackend):
                 logger.debug("Failed to move %s to CPU: %s", mod.__class__.__name__, exc)
         current_omni_platform.empty_cache()
 
+        # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
+        for res, name in zip(modules.resident_modules, modules.resident_names):
+            try:
+                res.to(self.device)
+            except Exception as exc:
+                logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
+
         apply_sequential_offload(
             all_modules=all_modules,
             device=self.device,
             pin_memory=self.config.pin_cpu_memory,
             use_hsdp=self.config.use_hsdp,
-            vae_modules=modules.vaes,
         )
 
         self._offload_modules = all_modules
         self.enabled = True
 
         logger.info(
-            "Model-level offloading enabled: %s (full mutual exclusion)",
+            "Model-level offloading enabled: %s (full mutual exclusion)%s",
             ", ".join(all_names),
+            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
         )
 
     def disable(self) -> None:
