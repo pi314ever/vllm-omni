@@ -230,18 +230,34 @@ class ModelLevelOffloadBackend(OffloadBackend):
             use_hsdp=self.config.use_hsdp,
         )
 
+        # Hook VAE .encode()/.decode() calls into hook registry.
+        wrapped_vae_methods: list[str] = []
+        for vae_mod, vae_name in zip(modules.vaes, modules.vae_names):
+            registry = HookRegistry.get_or_create(vae_mod)
+            for method_name in ("decode", "encode"):
+                if hasattr(vae_mod, method_name):
+                    registry.wrap_method(method_name)
+                    wrapped_vae_methods.append(f"{vae_name}.{method_name}")
+
         self._offload_modules = all_modules
         self.enabled = True
 
         logger.info(
-            "Model-level offloading enabled: %s (full mutual exclusion)%s",
+            "Model-level offloading enabled: %s (full mutual exclusion%s)%s",
             ", ".join(all_names),
+            f"; VAE method-wrap: {', '.join(wrapped_vae_methods)}" if wrapped_vae_methods else "",
             f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
         )
 
     def disable(self) -> None:
         if not self.enabled:
             return
+
+        # Unwrap any methods (e.g. vae.decode) before removing the hook.
+        for mod in self._offload_modules:
+            registry: HookRegistry | None = getattr(mod, "_hook_registry", None)
+            if registry is not None:
+                registry.unwrap_all_methods()
 
         remove_sequential_offload(self._offload_modules)
 
