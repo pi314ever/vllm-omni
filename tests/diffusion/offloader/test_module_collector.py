@@ -167,18 +167,6 @@ class AuxiliaryProtocolPipeline(nn.Module, SupportsComponentDiscovery):
         self.pipe.vocoder = nn.Linear(10, 10)
 
 
-class FallbackAuxiliaryPipeline(nn.Module):
-    """Pipeline (no protocol) with connectors/vocoder discovered via fallback."""
-
-    def __init__(self):
-        super().__init__()
-        self.transformer = nn.Linear(10, 10)
-        self.text_encoder = nn.Linear(10, 10)
-        self.vae = nn.Linear(10, 10)
-        self.connectors = nn.Linear(10, 10)
-        self.vocoder = nn.Linear(10, 10)
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -210,14 +198,6 @@ class TestFallbackDiscovery:
         result = ModuleDiscovery.discover(pipeline)
 
         assert len(result.encoders) == 0
-
-    def test_discovers_fallback_auxiliaries(self):
-        pipeline = FallbackAuxiliaryPipeline()
-        result = ModuleDiscovery.discover(pipeline)
-
-        assert result.auxiliary_names == ["connectors", "vocoder"]
-        assert result.auxiliaries[0] is pipeline.connectors
-        assert result.auxiliaries[1] is pipeline.vocoder
 
 
 class TestProtocolDiscovery:

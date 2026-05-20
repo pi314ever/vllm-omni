@@ -39,6 +39,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.base import OffloadGranularity
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.lora.request import LoRARequest
 
@@ -1131,6 +1132,7 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
     _auxiliary_modules: ClassVar[list[str]] = ["pipe.connectors", "pipe.vocoder"]
+    _offload_granularity: ClassVar[OffloadGranularity] = OffloadGranularity.STRICT
 
     def __init__(
         self,

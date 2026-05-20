@@ -11,7 +11,11 @@ from torch import nn
 
 from vllm_omni.diffusion.hooks.base import _WrappedMethod
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.base import (
+    OffloadConfig,
+    OffloadGranularity,
+    OffloadStrategy,
+)
 from vllm_omni.diffusion.offloader.sequential_backend import (
     ModelLevelOffloadBackend,
     SequentialOffloadHook,
@@ -164,18 +168,34 @@ class _StubVaeDecodeOnly(nn.Module):
         return self.proj(x)
 
 
-class _StubPipeline(nn.Module, SupportsComponentDiscovery):
-    """Minimal pipeline with the three categories needed for offloading."""
+class _StubStrictPipeline(nn.Module, SupportsComponentDiscovery):
+    """Minimal STRICT-mode pipeline (every component evicts every other)."""
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_granularity: ClassVar[OffloadGranularity] = OffloadGranularity.STRICT
 
     def __init__(self, decode_only_vae: bool = False):
         super().__init__()
         self.transformer = nn.Linear(8, 8)
         self.text_encoder = nn.Linear(8, 8)
         self.vae = _StubVaeDecodeOnly() if decode_only_vae else _StubVae()
+
+
+class _StubGroupedPipeline(nn.Module, SupportsComponentDiscovery):
+    """Minimal GROUPED-mode pipeline (legacy: VAE stays resident on GPU)."""
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    # _offload_granularity left at the protocol default = GROUPED.
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Linear(8, 8)
+        self.text_encoder = nn.Linear(8, 8)
+        self.vae = _StubVae()
 
 
 def _params_on(module: nn.Module, device: torch.device) -> bool:
@@ -193,12 +213,12 @@ def _params_on(module: nn.Module, device: torch.device) -> bool:
     return True
 
 
-class TestModelLevelOffloadVAEMethodWrap:
-    """Verify that VAE .decode/.encode are wrapped to trigger device swaps."""
+class TestModelLevelOffloadStrict:
+    """Verify STRICT granularity: full N-way exclusion + VAE method wrap."""
 
     def test_vae_decode_swaps_to_gpu_and_evicts_others(self, accelerator_device):
         """Calling vae.decode after enable() must swap VAE to GPU and evict others."""
-        pipeline = _StubPipeline()
+        pipeline = _StubStrictPipeline()
         cpu = torch.device("cpu")
 
         backend = ModelLevelOffloadBackend(
@@ -229,7 +249,7 @@ class TestModelLevelOffloadVAEMethodWrap:
 
     def test_disable_restores_original_decode(self, accelerator_device):
         """After disable(), vae.decode must be the original unwrapped method."""
-        pipeline = _StubPipeline()
+        pipeline = _StubStrictPipeline()
 
         backend = ModelLevelOffloadBackend(
             OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False),
@@ -254,7 +274,7 @@ class TestModelLevelOffloadVAEMethodWrap:
 
     def test_vae_without_encode_does_not_error(self, accelerator_device):
         """A VAE that only exposes .decode (no .encode) must not break enable()."""
-        pipeline = _StubPipeline(decode_only_vae=True)
+        pipeline = _StubStrictPipeline(decode_only_vae=True)
         assert not hasattr(pipeline.vae, "encode")
 
         backend = ModelLevelOffloadBackend(
@@ -266,5 +286,37 @@ class TestModelLevelOffloadVAEMethodWrap:
         # decode is still wrapped; encode is left alone (it doesn't exist).
         assert isinstance(pipeline.vae.decode, _WrappedMethod)
         assert not hasattr(pipeline.vae, "_omni_original_encode")
+
+        backend.disable()
+
+
+class TestModelLevelOffloadGrouped:
+    """Verify GROUPED (default) granularity preserves legacy behavior."""
+
+    def test_vae_stays_resident_on_gpu(self, accelerator_device):
+        """Under GROUPED, VAE is preloaded to GPU and stays there across DiT calls."""
+        pipeline = _StubGroupedPipeline()
+        cpu = torch.device("cpu")
+
+        backend = ModelLevelOffloadBackend(
+            OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False),
+            accelerator_device,
+        )
+        backend.enable(pipeline)
+
+        # GROUPED preloads encoders and VAEs on GPU.
+        assert _params_on(pipeline.text_encoder, accelerator_device)
+        assert _params_on(pipeline.vae, accelerator_device)
+
+        # Running the transformer must evict the text_encoder but leave VAE alone.
+        x = torch.randn(2, 8, device=accelerator_device)
+        _ = pipeline.transformer(x)
+        assert _params_on(pipeline.transformer, accelerator_device)
+        assert _params_on(pipeline.text_encoder, cpu)
+        assert _params_on(pipeline.vae, accelerator_device)
+
+        # VAE methods are NOT wrapped under GROUPED (no method-wrap plumbing).
+        assert not isinstance(pipeline.vae.decode, _WrappedMethod)
+        assert not hasattr(pipeline.vae, "_omni_original_decode")
 
         backend.disable()

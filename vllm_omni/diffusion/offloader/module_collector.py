@@ -33,7 +33,8 @@ class ModuleDiscovery:
     its ``_dit_modules``, ``_encoder_modules``, ``_vae_modules``,
     ``_resident_modules``, and ``_auxiliary_modules`` class variables
     are used directly.  Otherwise, falls back to scanning well-known
-    attribute names (including ``AUXILIARY_ATTRS`` for auxiliaries).
+    attribute names for dits/encoders/VAEs only; auxiliaries must be
+    declared via the protocol.
     """
 
     # Fallback attribute names for pipelines that do not implement
@@ -57,10 +58,6 @@ class ModuleDiscovery:
     _FALLBACK_VAE_ATTRS = [
         "vae",
         "audio_vae",
-    ]
-    _FALLBACK_AUXILIARY_ATTRS = [
-        "connectors",
-        "vocoder",
     ]
 
     @staticmethod
@@ -125,7 +122,7 @@ class ModuleDiscovery:
             enc_attrs = ModuleDiscovery._FALLBACK_ENCODER_ATTRS
             vae_attrs = ModuleDiscovery._FALLBACK_VAE_ATTRS
             res_attrs = []
-            aux_attrs = ModuleDiscovery._FALLBACK_AUXILIARY_ATTRS
+            aux_attrs = []
 
         dit_modules, dit_names = ModuleDiscovery._collect_modules(pipeline, dit_attrs, warn_missing=declared)
         encoders, encoder_names = ModuleDiscovery._collect_modules(pipeline, enc_attrs, warn_missing=declared)

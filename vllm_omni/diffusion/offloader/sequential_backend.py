@@ -9,8 +9,8 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
-from .base import OffloadBackend, OffloadConfig
-from .module_collector import ModuleDiscovery
+from .base import OffloadBackend, OffloadConfig, OffloadGranularity
+from .module_collector import ModuleDiscovery, PipelineModules
 
 logger = init_logger(__name__)
 
@@ -118,46 +118,45 @@ class SequentialOffloadHook(ModelHook):
 
 
 def apply_sequential_offload(
-    all_modules: list[nn.Module],
+    pipeline: nn.Module,
     device: torch.device,
+    *,
     pin_memory: bool = True,
     use_hsdp: bool = False,
-) -> None:
-    """Apply sequential offloading hooks with full mutual exclusion.
+) -> list[nn.Module]:
+    """Install model-level CPU-offload hooks on ``pipeline``.
 
-    Each module offloads ALL other modules to CPU before loading itself
-    to GPU. This ensures only one component occupies GPU memory at a time.
+    Discovers offloadable submodules, reads the pipeline's
+    ``_offload_granularity`` (defaults to :attr:`OffloadGranularity.GROUPED`
+    -- see :class:`OffloadGranularity`), preloads/evicts modules as
+    appropriate for that mode, and registers the per-module hooks.
 
-    Args:
-        all_modules: All pipeline modules to participate in offloading
-        device: Target GPU device for loading
-        pin_memory: Whether to pin CPU memory for faster transfers
-        use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
-
-    Example:
-        >>> apply_sequential_offload(
-        ...     all_modules=[pipeline.transformer, pipeline.text_encoder, pipeline.vae],
-        ...     device=torch.device("cuda:0"),
-        ... )
-        >>> # Modules of pipeline now automatically swap between CPU and GPU
+    Returns the list of modules that now carry hooks. Pass it to
+    :func:`remove_sequential_offload` to tear everything down.
     """
-    for module in all_modules:
-        offload_targets = [m for m in all_modules if m is not module]
-        registry = HookRegistry.get_or_create(module)
-        hook = SequentialOffloadHook(
-            offload_targets=offload_targets,
-            device=device,
-            pin_memory=pin_memory,
-            use_hsdp=use_hsdp,
-        )
-        registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
-        logger.debug(
-            "Registered offload hook for %s (targets: %d others)", module.__class__.__name__, len(offload_targets)
-        )
+    modules = ModuleDiscovery.discover(pipeline)
+    if not modules.dits:
+        logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+        return []
+    if not modules.encoders:
+        logger.warning("No encoder modules found, skipping model-level offloading")
+        return []
+
+    # Resident modules are always pinned to GPU regardless of granularity.
+    for res, name in zip(modules.resident_modules, modules.resident_names):
+        try:
+            res.to(device)
+        except Exception as exc:
+            logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
+
+    granularity = getattr(pipeline, "_offload_granularity", OffloadGranularity.GROUPED)
+    if granularity is OffloadGranularity.STRICT:
+        return _apply_strict_offload(modules, device, pin_memory, use_hsdp)
+    return _apply_grouped_offload(modules, device, pin_memory, use_hsdp)
 
 
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
-    """Remove sequential offloading hooks from modules.
+    """Remove sequential offloading hooks and unwraps any method-wraps from modules.
 
     Args:
         modules: Modules to remove hooks from
@@ -168,99 +167,138 @@ def remove_sequential_offload(modules: list[nn.Module]) -> None:
     """
     for module in modules:
         registry: HookRegistry | None = getattr(module, "_hook_registry", None)
-        if registry is not None:
-            registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
-            logger.debug("Removed offload hook from %s", module.__class__.__name__)
+        if registry is None:
+            continue
+        registry.unwrap_all_methods()
+        registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
+        logger.debug("Removed offload hook from %s", module.__class__.__name__)
+
+
+def _apply_grouped_offload(
+    modules: PipelineModules,
+    device: torch.device,
+    pin_memory: bool,
+    use_hsdp: bool,
+) -> list[nn.Module]:
+    """2-group mutual exclusion: dits vs encoders; VAEs/auxiliaries resident on GPU."""
+    for enc in modules.encoders:
+        enc.to(device)
+    for vae in modules.vaes:
+        try:
+            vae.to(device, non_blocking=True)
+        except Exception as exc:
+            logger.debug("Failed to move VAE to GPU: %s", exc)
+
+    # DiT hooks evict encoders + sibling dits; encoder hooks evict dits only.
+    for i, dit_mod in enumerate(modules.dits):
+        other_dits = [d for j, d in enumerate(modules.dits) if j != i]
+        _register_offload_hook(dit_mod, modules.encoders + other_dits, device, pin_memory, use_hsdp)
+    for enc in modules.encoders:
+        _register_offload_hook(enc, modules.dits, device, pin_memory, use_hsdp)
+
+    logger.info(
+        "Model-level offloading enabled (grouped): %s <-> %s%s",
+        ", ".join(modules.dit_names),
+        ", ".join(modules.encoder_names),
+        f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
+    )
+    return [*modules.dits, *modules.encoders]
+
+
+def _apply_strict_offload(
+    modules: PipelineModules,
+    device: torch.device,
+    pin_memory: bool,
+    use_hsdp: bool,
+) -> list[nn.Module]:
+    """Full N-way mutual exclusion + VAE ``.decode``/``.encode`` method wrap."""
+    all_modules: list[nn.Module] = [*modules.dits, *modules.encoders, *modules.auxiliaries, *modules.vaes]
+    all_names: list[str] = [
+        *modules.dit_names,
+        *modules.encoder_names,
+        *modules.auxiliary_names,
+        *modules.vae_names,
+    ]
+
+    # Bulk-move every participant to CPU; only the active one will live on GPU.
+    for mod in all_modules:
+        try:
+            SequentialOffloadHook._move_params(mod, torch.device("cpu"))
+        except Exception as exc:
+            logger.debug("Failed to move %s to CPU: %s", mod.__class__.__name__, exc)
+    current_omni_platform.empty_cache()
+
+    for module in all_modules:
+        offload_targets = [m for m in all_modules if m is not module]
+        _register_offload_hook(module, offload_targets, device, pin_memory, use_hsdp)
+
+    # VAEs are invoked via .decode()/.encode() rather than __call__, so the
+    # pre_forward hook never fires on them. Wrap those methods so the swap
+    # runs before each call. Skipped silently if the method is absent.
+    wrapped_vae_methods: list[str] = []
+    for vae_mod, vae_name in zip(modules.vaes, modules.vae_names):
+        registry = HookRegistry.get_or_create(vae_mod)
+        for method_name in ("decode", "encode"):
+            if hasattr(vae_mod, method_name):
+                registry.wrap_method(method_name)
+                wrapped_vae_methods.append(f"{vae_name}.{method_name}")
+
+    logger.info(
+        "Model-level offloading enabled (strict): %s%s%s",
+        ", ".join(all_names),
+        f"; VAE method-wrap: {', '.join(wrapped_vae_methods)}" if wrapped_vae_methods else "",
+        f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
+    )
+    return all_modules
+
+
+def _register_offload_hook(
+    module: nn.Module,
+    offload_targets: list[nn.Module],
+    device: torch.device,
+    pin_memory: bool,
+    use_hsdp: bool,
+) -> None:
+    registry = HookRegistry.get_or_create(module)
+    registry.register_hook(
+        SequentialOffloadHook._HOOK_NAME,
+        SequentialOffloadHook(
+            offload_targets=offload_targets,
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+        ),
+    )
+    logger.debug("Registered offload hook for %s", module.__class__.__name__)
 
 
 class ModelLevelOffloadBackend(OffloadBackend):
-    """Model-level (sequential) offloading backend.
+    """Thin wrapper around :func:`apply_sequential_offload`.
 
-    Uses SequentialOffloadHook registered via HookRegistry for automatic module swapping.
+    Granularity is selected per-pipeline via ``_offload_granularity``;
+    see :class:`OffloadGranularity`.
     """
 
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
-        self._offload_modules: list[nn.Module] = []  # Track modules with hooks
+        self._offload_modules: list[nn.Module] = []
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("ModelLevelOffloadBackend already enabled")
             return
-
-        modules = ModuleDiscovery.discover(pipeline)
-        if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
-            return
-        if not modules.encoders:
-            logger.warning("No encoder modules found, skipping model-level offloading")
-            return
-
-        all_modules: list[nn.Module] = []
-        all_names: list[str] = []
-
-        all_modules.extend(modules.dits)
-        all_names.extend(modules.dit_names)
-        all_modules.extend(modules.encoders)
-        all_names.extend(modules.encoder_names)
-        all_modules.extend(modules.auxiliaries)
-        all_names.extend(modules.auxiliary_names)
-        all_modules.extend(modules.vaes)
-        all_names.extend(modules.vae_names)
-
-        # Move ALL modules to CPU so only the active one occupies GPU
-        for mod in all_modules:
-            try:
-                SequentialOffloadHook._move_params(mod, torch.device("cpu"))
-            except Exception as exc:
-                logger.debug("Failed to move %s to CPU: %s", mod.__class__.__name__, exc)
-        current_omni_platform.empty_cache()
-
-        # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
-        for res, name in zip(modules.resident_modules, modules.resident_names):
-            try:
-                res.to(self.device)
-            except Exception as exc:
-                logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
-
-        apply_sequential_offload(
-            all_modules=all_modules,
-            device=self.device,
+        self._offload_modules = apply_sequential_offload(
+            pipeline,
+            self.device,
             pin_memory=self.config.pin_cpu_memory,
             use_hsdp=self.config.use_hsdp,
         )
-
-        # Hook VAE .encode()/.decode() calls into hook registry.
-        wrapped_vae_methods: list[str] = []
-        for vae_mod, vae_name in zip(modules.vaes, modules.vae_names):
-            registry = HookRegistry.get_or_create(vae_mod)
-            for method_name in ("decode", "encode"):
-                if hasattr(vae_mod, method_name):
-                    registry.wrap_method(method_name)
-                    wrapped_vae_methods.append(f"{vae_name}.{method_name}")
-
-        self._offload_modules = all_modules
-        self.enabled = True
-
-        logger.info(
-            "Model-level offloading enabled: %s (full mutual exclusion%s)%s",
-            ", ".join(all_names),
-            f"; VAE method-wrap: {', '.join(wrapped_vae_methods)}" if wrapped_vae_methods else "",
-            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
-        )
+        self.enabled = bool(self._offload_modules)
 
     def disable(self) -> None:
         if not self.enabled:
             return
-
-        # Unwrap any methods (e.g. vae.decode) before removing the hook.
-        for mod in self._offload_modules:
-            registry: HookRegistry | None = getattr(mod, "_hook_registry", None)
-            if registry is not None:
-                registry.unwrap_all_methods()
-
         remove_sequential_offload(self._offload_modules)
-
         self._offload_modules.clear()
         self.enabled = False
         logger.info("Model-level offloading disabled")
