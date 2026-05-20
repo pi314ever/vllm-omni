@@ -739,6 +739,7 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
+    _auxiliary_modules: ClassVar[list[str]] = ["pipe.connectors", "pipe.vocoder"]
 
     def __init__(
         self,

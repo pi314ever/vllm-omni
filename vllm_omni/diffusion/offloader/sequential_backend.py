@@ -118,57 +118,42 @@ class SequentialOffloadHook(ModelHook):
 
 
 def apply_sequential_offload(
-    dit_modules: list[nn.Module],
-    encoder_modules: list[nn.Module],
+    all_modules: list[nn.Module],
     device: torch.device,
     pin_memory: bool = True,
     use_hsdp: bool = False,
 ) -> None:
-    """Apply sequential offloading hooks to DiT and encoder modules.
+    """Apply sequential offloading hooks with full mutual exclusion.
 
-    Registers hooks on modules to implement mutual-exclusion GPU allocation.
-        - Before DiT runs, encoders are offloaded to CPU.
-        - Before encoders run, DiT is offloaded to CPU.
+    Each module offloads ALL other modules to CPU before loading itself
+    to GPU. This ensures only one component occupies GPU memory at a time.
 
     Args:
-        dit_modules: DiT/transformer modules to register hooks on
-        encoder_modules: Encoder modules to register hooks on
+        all_modules: All pipeline modules to participate in offloading
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
         use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
 
     Example:
         >>> apply_sequential_offload(
-        ...     dit_modules=[pipeline.transformer],
-        ...     encoder_modules=[pipeline.text_encoder, pipeline.vae],
+        ...     all_modules=[pipeline.transformer, pipeline.text_encoder, pipeline.vae],
         ...     device=torch.device("cuda:0"),
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
-    # Register hooks on DiT modules (offload encoders AND other DiTs when a DiT runs)
-    for i, dit_mod in enumerate(dit_modules):
-        other_dits = [d for j, d in enumerate(dit_modules) if j != i]
-        registry = HookRegistry.get_or_create(dit_mod)
+    for module in all_modules:
+        offload_targets = [m for m in all_modules if m is not module]
+        registry = HookRegistry.get_or_create(module)
         hook = SequentialOffloadHook(
-            offload_targets=encoder_modules + other_dits,
+            offload_targets=offload_targets,
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
-        logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
-
-    # Register hooks on encoders (offload DiTs when encoder runs)
-    for enc in encoder_modules:
-        registry = HookRegistry.get_or_create(enc)
-        hook = SequentialOffloadHook(
-            offload_targets=dit_modules,
-            device=device,
-            pin_memory=pin_memory,
-            use_hsdp=use_hsdp,
+        logger.debug(
+            "Registered offload hook for %s (targets: %d others)", module.__class__.__name__, len(offload_targets)
         )
-        registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
-        logger.debug("Registered offload hook for %s", enc.__class__.__name__)
 
 
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
@@ -211,16 +196,25 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.warning("No encoder modules found, skipping model-level offloading")
             return
 
-        # Move encoders to GPU
-        for enc in modules.encoders:
-            enc.to(self.device)
+        all_modules: list[nn.Module] = []
+        all_names: list[str] = []
 
-        # Move VAE(s) to GPU if available
-        for vae in modules.vaes:
+        all_modules.extend(modules.dits)
+        all_names.extend(modules.dit_names)
+        all_modules.extend(modules.encoders)
+        all_names.extend(modules.encoder_names)
+        all_modules.extend(modules.auxiliaries)
+        all_names.extend(modules.auxiliary_names)
+        all_modules.extend(modules.vaes)
+        all_names.extend(modules.vae_names)
+
+        # Move ALL modules to CPU so only the active one occupies GPU
+        for mod in all_modules:
             try:
-                vae.to(self.device, non_blocking=True)
+                SequentialOffloadHook._move_params(mod, torch.device("cpu"))
             except Exception as exc:
-                logger.debug("Failed to move VAE to GPU: %s", exc)
+                logger.debug("Failed to move %s to CPU: %s", mod.__class__.__name__, exc)
+        current_omni_platform.empty_cache()
 
         # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
         for res, name in zip(modules.resident_modules, modules.resident_names):
@@ -229,24 +223,19 @@ class ModelLevelOffloadBackend(OffloadBackend):
             except Exception as exc:
                 logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
 
-        # Apply sequential offloading hooks
         apply_sequential_offload(
-            dit_modules=modules.dits,
-            encoder_modules=modules.encoders,
+            all_modules=all_modules,
             device=self.device,
             pin_memory=self.config.pin_cpu_memory,
             use_hsdp=self.config.use_hsdp,
         )
 
-        # Track modules for cleanup
-        self._offload_modules = [*modules.dits, *modules.encoders]
-
+        self._offload_modules = all_modules
         self.enabled = True
 
         logger.info(
-            "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
-            ", ".join(modules.dit_names),
-            ", ".join(modules.encoder_names),
+            "Model-level offloading enabled: %s (full mutual exclusion)%s",
+            ", ".join(all_names),
             f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
         )
 
