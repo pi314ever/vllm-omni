@@ -30,12 +30,10 @@ class ModuleDiscovery:
     """Discovers pipeline components.
 
     If the pipeline implements :class:`SupportsComponentDiscovery`,
-    its ``_dit_modules``, ``_encoder_modules``, ``_vae_modules``, and
-    ``_resident_modules`` class variables are used directly.  Otherwise,
-    falls back to scanning well-known attribute names.
-
-    Auxiliary modules (``connectors``, ``vocoder``) are always discovered
-    by attribute scan and deduped against the protocol-declared lists.
+    its ``_dit_modules``, ``_encoder_modules``, ``_vae_modules``,
+    ``_resident_modules``, and ``_auxiliary_modules`` class variables
+    are used directly.  Otherwise, falls back to scanning well-known
+    attribute names (including ``AUXILIARY_ATTRS`` for auxiliaries).
     """
 
     # Fallback attribute names for pipelines that do not implement
@@ -60,10 +58,7 @@ class ModuleDiscovery:
         "vae",
         "audio_vae",
     ]
-    # Auxiliary attrs are always scanned regardless of whether the pipeline
-    # implements SupportsComponentDiscovery.  Deferred until a follow-up
-    # promotes auxiliaries to a first-class protocol field.
-    AUXILIARY_ATTRS = [
+    _FALLBACK_AUXILIARY_ATTRS = [
         "connectors",
         "vocoder",
     ]
@@ -124,24 +119,22 @@ class ModuleDiscovery:
             enc_attrs = pipeline._encoder_modules
             vae_attrs = pipeline._vae_modules
             res_attrs = pipeline._resident_modules
+            aux_attrs = pipeline._auxiliary_modules
         else:
             dit_attrs = ModuleDiscovery._FALLBACK_DIT_ATTRS
             enc_attrs = ModuleDiscovery._FALLBACK_ENCODER_ATTRS
             vae_attrs = ModuleDiscovery._FALLBACK_VAE_ATTRS
             res_attrs = []
+            aux_attrs = ModuleDiscovery._FALLBACK_AUXILIARY_ATTRS
 
         dit_modules, dit_names = ModuleDiscovery._collect_modules(pipeline, dit_attrs, warn_missing=declared)
         encoders, encoder_names = ModuleDiscovery._collect_modules(pipeline, enc_attrs, warn_missing=declared)
         vaes, vae_names = ModuleDiscovery._collect_modules(pipeline, vae_attrs, warn_missing=declared)
         residents, resident_names = ModuleDiscovery._collect_modules(pipeline, res_attrs, warn_missing=declared)
-
-        # Auxiliaries are always scanned via the legacy attribute list, then
-        # deduped against modules already discovered as dit/encoder/vae/resident
-        # so a pipeline re-exposing the same submodule under multiple names is
-        # not registered for offload twice.
         aux_candidates, aux_candidate_names = ModuleDiscovery._collect_modules(
-            pipeline, ModuleDiscovery.AUXILIARY_ATTRS, warn_missing=False
+            pipeline, aux_attrs, warn_missing=declared
         )
+
         already_seen: set[int] = {id(m) for m in (*dit_modules, *encoders, *vaes, *residents)}
         auxiliaries: list[nn.Module] = []
         auxiliary_names: list[str] = []

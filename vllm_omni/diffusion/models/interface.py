@@ -75,12 +75,16 @@ class SupportsComponentDiscovery(Protocol):
         _vae_modules: VAE(s) (always on GPU).
         _resident_modules: Extra modules pinned on GPU during layerwise
             offloading.  Optional, defaults to ``[]``.
+        _auxiliary_modules: Extra offload-participating submodules that
+            do not fit the dit/encoder/vae categories (e.g. connectors,
+            vocoders).  Optional, defaults to ``[]``.
     """
 
     _dit_modules: ClassVar[list[str]]
     _encoder_modules: ClassVar[list[str]]
     _vae_modules: ClassVar[list[str]]
     _resident_modules: ClassVar[list[str]] = []
+    _auxiliary_modules: ClassVar[list[str]] = []
 
 
 def supports_step_execution(pipeline: object) -> bool:
