@@ -14,13 +14,13 @@ Both strategies use pinned memory for faster CPU-GPU transfers. The strategies a
 
 ### How It Works
 
-Model-level offloading implements mutual exclusion between DiT transformer and encoder modules using pre forward hooks:
+Model-level offloading implements **full N-way mutual exclusion** across DiT, encoder, VAE, and auxiliary modules using pre forward hooks. At most one of these components occupies GPU memory at a time:
 
-- **When encoders run**: DiT transformer is offloaded to CPU
-- **When DiT runs**: Encoders are offloaded to CPU, if more than one dit models, only one loaded on GPU, others get offloaded to CPU.
-- **VAE**: Stays resident on GPU
+- **When any module runs**: every other participating module is offloaded to CPU before the current one is loaded to GPU.
+- **VAE**: also participates in the mutual exclusion. Because VAEs are typically invoked via `.decode()` / `.encode()` rather than `__call__`, the backend additionally wraps those methods so the device-swap fires on each call.
+- **Auxiliaries** (e.g. connectors, vocoders): participate the same way as encoders/DiTs (swap on `__call__`).
 
-Before each module's forward pass, the hook automatically moves it to GPU while offloading the other module group to CPU. Transfers use pinned memory for speed.
+Before each module's forward pass (or wrapped `.decode`/`.encode` call), the hook moves it to GPU while offloading every other participating module to CPU. Transfers use pinned memory for speed.
 
 ### Usage
 
@@ -50,22 +50,27 @@ class MyPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "vision_model"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
-    _resident_modules: ClassVar[list[str]] = []  # optional
+    _auxiliary_modules: ClassVar[list[str]] = []  # optional — e.g. connectors, vocoders
+    _resident_modules: ClassVar[list[str]] = []   # optional
 
     def __init__(self):
         super().__init__()
-        self.transformer = ...     # DiT — stays on GPU during denoising
-        self.text_encoder = ...    # Encoder — offloaded to CPU during denoising
-        self.vision_model = ...    # Encoder — offloaded to CPU during denoising
-        self.vae = ...             # VAE — always on GPU
+        self.transformer = ...     # DiT — on GPU while denoising
+        self.text_encoder = ...    # Encoder — on GPU only while encoding
+        self.vision_model = ...    # Encoder — on GPU only while encoding
+        self.vae = ...             # VAE — on GPU only while decoding/encoding
 ```
 
-- `_dit_modules`: attribute names of denoising submodules (kept on GPU
-  during the diffusion loop).
-- `_encoder_modules`: attribute names of encoder/vision submodules
-  (offloaded to CPU during the diffusion loop).
-- `_vae_modules`: attribute names of VAE(s) (always kept on GPU, not
-  part of the mutual exclusion hooks).
+- `_dit_modules`: attribute names of denoising submodules.
+- `_encoder_modules`: attribute names of encoder/vision submodules.
+- `_vae_modules`: attribute names of VAE(s). VAEs participate in the
+  mutual exclusion; the backend wraps their `.decode` and `.encode`
+  methods so the device-swap fires on those non-`forward` entry points.
+- `_auxiliary_modules`: attribute names of other offload-participating
+  submodules that do not fit the dit/encoder/vae categories — e.g.
+  text-to-prompt connectors, vocoders. Optional — defaults to `[]`.
+  See the LTX2 pipelines (`vllm_omni/diffusion/models/ltx2/`) for an
+  example.
 - `_resident_modules`: attribute names of small submodules that must
   stay on GPU during layerwise offloading (e.g. embedders, connectors).
   Optional — defaults to `[]`.
@@ -73,8 +78,9 @@ class MyPipeline(nn.Module, SupportsComponentDiscovery):
 All attribute names support dotted paths for nested submodules
 (e.g. `"pipe.transformer"`, `"bagel.time_embedder"`).
 
-Both DiT and encoder lists are needed because the offload hooks use
-mutual exclusion: when one group runs, the other moves to CPU.
+All declared modules participate in the same N-way mutual exclusion:
+when any one of them runs, every other participating module is moved
+to CPU first.
 
 ### Limitations
 - Cold start latency increases
@@ -160,15 +166,17 @@ The offloader discovers pipeline components in two ways:
 
 1. **Protocol-based** (preferred): If the pipeline implements
     `SupportsComponentDiscovery`, its `_dit_modules`, `_encoder_modules`,
-    `_vae_modules`, and `_resident_modules` class variables are used
-    directly.  All attribute names support dotted paths (e.g.
-    `"pipe.transformer"`, `"bagel.time_embedder"`) for nested submodules.
+    `_vae_modules`, `_auxiliary_modules`, and `_resident_modules` class
+    variables are used directly.  All attribute names support dotted
+    paths (e.g. `"pipe.transformer"`, `"bagel.time_embedder"`) for
+    nested submodules.
 
 2. **Fallback attribute scan**: Otherwise, the offloader scans for
     well-known attribute names:
     - **DiT modules**: `transformer`, `transformer_2`, `dit`, `sr_dit`, `language_model`, `transformer_blocks`, `model`
-    - **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
+    - **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`, `mllm`
     - **VAE**: `vae`, `audio_vae`
+    - **Auxiliaries**: `connectors`, `vocoder`
 
 **Hook System**
 
