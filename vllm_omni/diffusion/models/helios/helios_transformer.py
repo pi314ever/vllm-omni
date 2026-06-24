@@ -795,6 +795,15 @@ class HeliosTransformer3DModel(nn.Module):
         self._projected_encoder_cache.clear()
         self._cross_attn_kv_cache.clear()
 
+    def _is_layerwise_offload_active(self) -> bool:
+        """Check if layerwise offload hooks are registered on the blocks."""
+        if not self.blocks:
+            return False
+        registry = getattr(self.blocks[0], '_hook_registry', None)
+        if registry is None:
+            return False
+        return registry.get_hook('layerwise_offload') is not None
+
     def _cache_enabled(self) -> bool:
         return not self.training and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
 
@@ -816,6 +825,9 @@ class HeliosTransformer3DModel(nn.Module):
         encoder_hidden_states: torch.Tensor,
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
         if not self._cache_enabled():
+            return None
+
+        if self._is_layerwise_offload_active():
             return None
 
         cache_key = self._tensor_cache_key(encoder_hidden_states)
