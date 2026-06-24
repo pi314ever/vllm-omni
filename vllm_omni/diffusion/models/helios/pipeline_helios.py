@@ -953,6 +953,10 @@ class HeliosPipeline(
         # Read Helios-specific params from extra_args
         extra = getattr(req.sampling_params, "extra_args", {}) or {}
         is_enable_stage2 = extra.get("is_enable_stage2", is_enable_stage2)
+        # Distilled models (DMD scheduler) require stage2 path which passes
+        # dmd_sigmas, dmd_timesteps, all_timesteps, cur_sampling_step to scheduler
+        if self.is_distilled:
+            is_enable_stage2 = True
         pyramid_num_stages = extra.get("pyramid_num_stages", pyramid_num_stages)
         pyramid_num_inference_steps_list = extra.get(
             "pyramid_num_inference_steps_list", pyramid_num_inference_steps_list
@@ -1484,6 +1488,21 @@ class HeliosPipeline(
                 if self.is_distilled and start_point_list is not None:
                     start_point_list.append(latents)
 
+            # Pad latent spatial dims to be divisible by patch_size to avoid
+            # shape mismatch between transformer output and input latents.
+            # E.g. height=15 with patch_h=2 -> stride 2 produces 7 patches ->
+            # unpatchify gives 14, mismatching the input 15.
+            patch_h, patch_w = patch_size[1], patch_size[2]
+            cur_h, cur_w = latents.shape[3], latents.shape[4]
+            pad_h = (patch_h - cur_h % patch_h) % patch_h
+            pad_w = (patch_w - cur_w % patch_w) % patch_w
+            if pad_h > 0 or pad_w > 0:
+                latents = F.pad(latents, (0, pad_w, 0, pad_h), mode='reflect')
+                if self.is_distilled and start_point_list is not None:
+                    start_point_list[i_s] = F.pad(
+                        start_point_list[i_s], (0, pad_w, 0, pad_h),
+                        mode='reflect')
+
             with self.progress_bar(total=len(timesteps)) as pbar:
                 for idx, t in enumerate(timesteps):
                     self._current_timestep = t
@@ -1543,6 +1562,10 @@ class HeliosPipeline(
                     )[0]
 
                     pbar.update()
+
+            # Remove padding after denoising at this stage
+            if pad_h > 0 or pad_w > 0:
+                latents = latents[:, :, :, :cur_h, :cur_w]
 
         return latents
 
